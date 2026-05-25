@@ -242,8 +242,14 @@ rdtsc()
     return ((uint64_t(hi) << 32) | lo);
 #elif defined(__powerpc64__)
     return (__builtin_ppc_get_timebase());
+#elif defined(__aarch64__)
+    uint64_t virtualTimer;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r" (virtualTimer));
+    return virtualTimer;
 #else
-#error "Unsupported platform."
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return uint64_t(ts.tv_sec) * 1000000000UL + uint64_t(ts.tv_nsec);
 #endif
 }
 

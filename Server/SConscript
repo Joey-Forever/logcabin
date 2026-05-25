@@ -14,3 +14,5 @@ object_files['Server'] = (env.StaticObject(src) +
                           env.Protobuf("SnapshotMetadata.proto") +
                           env.Protobuf("SnapshotStateMachine.proto") +
                           env.Protobuf("SnapshotStats.proto"))
+env.Depends("SnapshotMetadata.proto", "#Protocol/Raft.proto")
+env.Depends("SnapshotStateMachine.proto", "#Protocol/Client.proto")

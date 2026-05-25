@@ -13,3 +13,5 @@ src = [
 object_files['Storage'] = (env.StaticObject(src) +
                            env.Protobuf("SegmentedLog.proto") +
                            env.Protobuf("SimpleFileLog.proto"))
+env.Depends("SegmentedLog.proto", "#Protocol/RaftLogMetadata.proto")
+env.Depends("SimpleFileLog.proto", "#Protocol/RaftLogMetadata.proto")
