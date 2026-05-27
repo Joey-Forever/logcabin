@@ -139,6 +139,10 @@ template<typename T>
 Writer::SharedMMap<T>::SharedMMap()
     : value(NULL)
 {
+    // ！！！
+    // 通过mmap在内核态直接申请一块共享内存空间，从而避免fork机制的COW，这样后续
+    // 在子进程不断写入snapshot的时候，可以同步更新该变量，父进程可以直接读取该变量
+    // 获取子进程的更新值。
     void* addr = mmap(NULL,
                       sizeof(*value),
                       PROT_READ|PROT_WRITE,
@@ -192,6 +196,10 @@ Writer::discard()
     file.close();
 }
 
+// 该方法主要是为了，如果文件写操作是先把内容写到用户态buffer的话，在fork子进程之前或者子进程退出之前
+// 需要调用该方法显式把自己进程写的内容同步回内核态，然后其他父/子进程才可以看到你写的内容已经落实到文件偏移中（不一定sync）。
+// 由于当前的文件写操作都是直接执行writev系统调用的，调用返回的时候内容已经进入了内核态，所以不需要
+// 该方法执行额外操作了。
 void
 Writer::flushToOS()
 {
@@ -212,6 +220,7 @@ Writer::save()
 {
     if (file.fd < 0)
         PANIC("File already closed");
+    // 需要先保证file sync成功之后再rename 目录项，否则rename成功但file sync之前崩溃的话，就会出问题
     FilesystemUtil::fsync(file);
     uint64_t fileSize = FilesystemUtil::getSize(file);
     file.close();
@@ -232,6 +241,8 @@ Writer::writeMessage(const google::protobuf::Message& message)
 {
     Core::Buffer buf;
     Core::ProtoBuf::serialize(message, buf);
+    // message size本身不属于protobuf内容本身，需要在写入文件之前将其
+    // 转化成固定的big-endian字节序。
     uint32_t beSize = htobe32(uint32_t(buf.getLength()));
     ssize_t r = FilesystemUtil::write(file.fd, {
                                           {&beSize, sizeof(beSize)},
@@ -256,6 +267,7 @@ Writer::writeRaw(const void* data, uint64_t length)
               strerror(errno));
     }
     bytesWritten += Core::Util::downCast<uint64_t>(r);
+    // 更新位于内核态mmap共享内存的变量，以供其他进程读取
     *sharedBytesWritten.value += Core::Util::downCast<uint64_t>(r);
 }
 

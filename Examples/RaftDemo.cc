@@ -13,6 +13,9 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+//JOEY_TODO:
+//  1、提供一个类似于etcd的基于CAS的Txn逻辑。
+//  2、只需要支持get、put、erase逻辑，写操作都是value全量覆盖。
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +56,7 @@ std::string joinPath(const std::string& a, const std::string& b);
 void mkdirIfNeeded(const std::string& path);
 
 const char* SERVER_BINARY = "build/LogCabin";
+const char* STORAGE_TOOL_BINARY = "build/Storage/Tool";
 const char* WORKDIR = "raftdemo";
 const char* LOG_POLICY = "NOTICE";
 const char* CLIENT_PATH = "/demo/message";
@@ -218,6 +222,8 @@ spawn(const std::vector<std::string>& command,
         }
         std::vector<std::string> args = command;
         std::vector<char*> argv = makeArgv(args);
+        // 重新启动二进制可执行程序，开一个全新的地址空间替换原本的地址空间，成功之后父进程和子进程就不会再存在COW关系。
+        // 由于FD_CLOEXEC没有设置过，所以stdout和stderr的重定向会被保留。
         execvp(argv[0], &argv[0]);
         _exit(127);
     }
@@ -256,12 +262,34 @@ checkServers(const std::vector<Process>& processes)
 {
     for (size_t i = 0; i < processes.size(); ++i) {
         int status = 0;
+        // 传递了WNOHANG，所以这里不会阻塞等待pid子进程退出，只是检查一下子进程当前的状态后马上返回
         pid_t result = waitpid(processes[i].pid, &status, WNOHANG);
         if (result == processes[i].pid)
+            // 该server子进程已经退出了，报错
             throw std::runtime_error("server " +
                                      std::to_string(processes[i].serverId) +
                                      " exited; see " +
                                      processes[i].logPath);
+    }
+}
+
+void
+dumpReadableRaftLogs(const std::vector<std::string>& configs)
+{
+    if (access(STORAGE_TOOL_BINARY, X_OK) != 0) {
+        std::cout << "Skipping readable raft log dumps: missing executable "
+                  << STORAGE_TOOL_BINARY << std::endl;
+        return;
+    }
+    for (size_t i = 0; i < configs.size(); ++i) {
+        std::string dumpPath = joinPath(WORKDIR,
+                                        "server" + std::to_string(i + 1) +
+                                        ".raftlog.txt");
+        pid_t pid = spawn({STORAGE_TOOL_BINARY, "--config", configs[i]},
+                          dumpPath);
+        waitSuccess(pid, "raft log dump for server " +
+                         std::to_string(i + 1));
+        std::cout << "Wrote readable raft log dump " << dumpPath << std::endl;
     }
 }
 
@@ -308,6 +336,12 @@ runClient()
     LogCabin::Client::Debug::setLogPolicy(
         LogCabin::Client::Debug::logPolicyFromString(LOG_POLICY));
 
+    // client需要访问（无论读写）某一个Raft集群时，先基于集群的servers地址信息创建一个Cluster实例，
+    // Cluster实例持有一个
+    //    ---->ClientImpl实例持有一个
+    //        ---->LeaderRPC实例（负责和RPC系统对接）
+    //        ---->ExactlyOnceRPCHelper实例持有一个
+    //            ---->（写操作才有，懒创建）raft log中的openSession（由一个ExactlyOnceRPCHelper::keepAliveThreadMain线程保活，防止server状态机中的session表清理）
     Cluster cluster(clusterAddresses());
     Tree tree = cluster.getTree();
 
@@ -397,6 +431,7 @@ runLauncher()
         std::cout << "Client completed" << std::endl;
 
         terminate(servers);
+        dumpReadableRaftLogs(configs);
         return 0;
     } catch (...) {
         terminate(servers);

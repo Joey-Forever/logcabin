@@ -32,12 +32,17 @@ SessionManager::SessionManager(Event::Loop& eventLoop,
 {
 }
 
+// 1.主要有两个使用场景：
+//   1） raft client端通过该方法创建一个连接上目标leader server的rpc session
+//   2） server节点通过该方法创建一个连接上目标peer serevr的rpc session
+// 2. tcp连接上之后会马上执行clusterUUID:serverId verify，失败的话会返回一个没有tcp连接的error session，原来的连接tcp session被析构
 std::shared_ptr<RPC::ClientSession>
 SessionManager::createSession(const RPC::Address& address,
                               RPC::Address::TimePoint timeout,
                               ClusterUUID* clusterUUID,
                               ServerId* serverId)
 {
+    // 1. 成功TCP connect对应的server节点
     std::shared_ptr<RPC::ClientSession> session =
         RPC::ClientSession::makeSession(
                         eventLoop,
@@ -48,7 +53,9 @@ SessionManager::createSession(const RPC::Address& address,
     if (!session->getErrorMessage().empty() || skipVerify)
         return session;
 
+    // 2. 给连接上的server节点发送verify request，确保对方的实际clusterUUID:serverId就是自己想连接的那个
     Protocol::Client::VerifyRecipient::Request request;
+    // 如果自己本地有记录对端server的clusterUUID或者serevrId，就带上，但是检测的时候以对端的实际值为准
     if (clusterUUID != NULL) {
         std::string uuid = clusterUUID->getOrDefault();
         if (!uuid.empty())
@@ -74,7 +81,10 @@ SessionManager::createSession(const RPC::Address& address,
     // Decode the response
     switch (status) {
         case RPCStatus::OK:
+            // 这里只是说明正常收到了对端回复的rpc response，但是对端的实际的verify结果还要进一步看response的实际内容
             if (response.ok()) {
+                // 至少说明本地记录的值（如果有）和对端实际的值（如果有）没有冲突，
+                // 那么以对端server response回来的结果设置本地的值
                 if (!request.has_cluster_uuid() &&
                     response.has_cluster_uuid() &&
                     !response.cluster_uuid().empty() &&
@@ -88,6 +98,7 @@ SessionManager::createSession(const RPC::Address& address,
                 }
                 return session;
             } else {
+                // 本地记录的对端server的clusterUUID或serverId和对端的实际值冲突了
                 ERROR("Intended recipient was not at %s: %s. "
                       "Closing session.",
                       session->toString().c_str(),
@@ -115,6 +126,8 @@ SessionManager::createSession(const RPC::Address& address,
             PANIC("The server's ClientService doesn't support the "
                   "VerifyRecipient RPC or claims the request is malformed");
     }
+    // clusterUUID:serverId verify失败，返回一个没有TCP连接的error session，原本的
+    // 已有tcp连接session会被析构断连
     return RPC::ClientSession::makeErrorSession(
         eventLoop,
         Core::StringUtil::format("Verifying recipient with %s failed "

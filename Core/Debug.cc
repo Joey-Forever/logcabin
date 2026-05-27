@@ -103,6 +103,8 @@ DebugMessage::operator=(DebugMessage&& other)
 }
 
 
+// 静态存储期变量，位于全局数据区，生命周期贯穿整个进程。
+// 不带static修饰时具有外部链接，其他.cc中可以通过extern声明后使用
 std::string processName = Core::StringUtil::format("%u", getpid());
 
 namespace Internal {
@@ -143,6 +145,7 @@ std::string logFilename;
 /**
  * Where log messages go (unless logHandler is set).
  */
+// config文件没有指定了log输出文件的时候，就是通过stderr输出
 FILE* stream = stderr;
 
 /**
@@ -229,6 +232,8 @@ calculateLengthFilePrefix()
 }
 
 /// Stores result of calculateLengthFilePrefix().
+// __FILE__的absolute path完整文件路径截断这个prefix之后，得到的就是以当前项目源码根目录为基准的relative path了，
+// log的输出只需要记录relative path即可
 const size_t lengthFilePrefix = calculateLengthFilePrefix();
 
 /**
@@ -264,6 +269,7 @@ getLogFilename()
 std::string
 setLogFilename(const std::string& filename)
 {
+    // 文件存在就以append打开，不存在就创建
     FILE* next = fopen(filename.c_str(), "a");
     if (next == NULL) {
         return Core::StringUtil::format(
@@ -275,6 +281,7 @@ setLogFilename(const std::string& filename)
     {
         std::lock_guard<std::mutex> lockGuard(mutex);
         old = stream;
+        // 将log的输出目标转到append追加到filename文件中
         stream = next;
         logFilename = filename;
     }
@@ -329,6 +336,7 @@ setLogPolicy(const std::vector<std::pair<std::string,
 {
     std::lock_guard<std::mutex> lockGuard(mutex);
     logPolicy = newPolicy;
+    // reset logPolicy时必须要clear cache
     isLoggingCache.clear();
 }
 
@@ -340,6 +348,20 @@ setLogPolicy(const std::initializer_list<std::pair<std::string,
                                          std::string>>(newPolicy));
 }
 
+// 按照如下规则解析log policy：
+//  pattern@level,pattern@level,...,默认level
+// 例如：
+//  logPolicy_raw_str = "Server/RaftConsensus.cc@VERBOSE,Server/@WARNING,NOTICE"
+// 就会解析出vector<pair>类型的log policy：
+// {
+//     {"Server/RaftConsensus.cc", "VERBOSE"},
+//     {"Server/",                 "WARNING"},
+//     {"",                        "NOTICE"}
+// }
+// 指的是relative file path name以pair.first为前缀或后缀的源码文件，只允许打出log级别比pair.second相同或更严重的log level，
+// 这允许线上动态的对某个特定模块打开更细粒度的log协助诊断。
+// 注意默认level必须放到最后，因为isLogging检查时是按log policy顺序匹配的，而且默认level的pair.first是空字符串，可以匹配所有
+// relative file path name。
 std::vector<std::pair<std::string, std::string>>
 logPolicyFromString(const std::string& in)
 {
@@ -399,6 +421,15 @@ operator<<(std::ostream& ostream, LogLevel level)
     return ostream;
 }
 
+// fileName通常是__FILE__，也就是调用打log的那个源码文件的absolute path name，该方法用于检测该源码文件
+// 是否支持传入level的log级别输出，只有传入level严重程度大于该源码文件支持level时才return true。
+// 由于这个方法会去log policy中匹配字符串，为了避免同个源码文件每次打log执行isLogging时都跑字符串匹配，
+// 使用isLoggingCache保存匹配结果，reset log policy时再clear cache。
+// ！！！
+// 注意，为了保持分布式系统的线上诊断能力，release时不能将所有低级别log都编译掉，要保留能够随时线上运行时打开低级别
+// 细化log的能力（使用reset log policy做到）。这也就意味着，即使release时低级别的log不会真正被打出来，但是仍然会每次都进入
+// isLogging方法中执行判断。所以isLogging方法尽量无锁轻量级非常重要。
+// JOEY_TODO: 优化isLogging的判断逻辑，让release下能够无锁轻量的过滤低级别log
 bool
 isLogging(LogLevel level, const char* fileName)
 {
@@ -458,6 +489,7 @@ log(LogLevel level,
         formattedSeconds[sizeof(formattedSeconds) - 1] = '\0';
     }
 
+    // 将日志打到stream指向的log文件中，对于daemon模式必须在config文件中指定，否则就是stderr
     fprintf(stream, "%s.%06lu %s:%d in %s() %s[%s:%s]: %s\n",
             formattedSeconds, now.tv_nsec / 1000,
             relativeFileName(fileName), lineNum, functionName,
@@ -465,6 +497,9 @@ log(LogLevel level,
             processName.c_str(), ThreadId::getName().c_str(),
             message);
 
+    // fprintf只是将log内容写入用户态缓冲区，需要执行fflush方法调用write系统调用将内容同步回内核态page cache文件本体，
+    // 这样在程序崩溃之后，log文件内容才仍然可见且不丢失（例如PANIC，就是在打ERROR日志之后abort使程序崩溃）。
+    // 需要注意的是，出于性能以及debug log本身内容性质考虑，这里并不会调用fsync持久化，所以如果断电的话log可能丢失。
     fflush(stream);
 }
 

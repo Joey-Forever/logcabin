@@ -227,6 +227,8 @@ class Globals {
     /**
      * Listens for inbound RPCs and passes them off to the services.
      */
+    // ！！！！
+    // 必须最后一个声明，保证在内部各service析构、各worker线程完成最后工作之前，raft实例和state machine实例是还存在的
     std::unique_ptr<RPC::Server> rpcServer;
 
     // Globals is non-copyable.

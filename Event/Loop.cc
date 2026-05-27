@@ -120,6 +120,8 @@ Loop::~Loop()
     }
 }
 
+// 每个client节点或server节点会持有一个主event loop，对应一个epoll，用于监听该节点的socket、timer、signal事件然后执行
+// handleFileEvent回调。专门的一个后台线程会在runForever方法内轮询epoll_wait处理到来的每一个事件。
 void
 Loop::runForever()
 {

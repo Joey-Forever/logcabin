@@ -77,6 +77,7 @@ ClientSession::MessageSocketHandler::MessageSocketHandler(
 {
 }
 
+// 和OpaqueServer的handleReceivedMessage相对，用于处理server发送过来的消息。
 void
 ClientSession::MessageSocketHandler::handleReceivedMessage(
         MessageId messageId,
@@ -89,6 +90,8 @@ ClientSession::MessageSocketHandler::handleReceivedMessage(
             // The server has shown that it is alive for now.
             // Let's get suspicious again in another PING_TIMEOUT_NS.
             session.activePing = false;
+            // ping心跳在超时时间内收到了回复，activePing设置false后重置下一次心跳发送时间（旧时间被覆盖）。
+            // 这段时间内都不会发送心跳，直到这个时间到来时handleTimerEvent被调用后正常发送心跳。
             session.timer.schedule(session.PING_TIMEOUT_NS);
         } else {
             VERBOSE("Received an unexpected ping response. This can happen "
@@ -191,6 +194,8 @@ ClientSession::Timer::handleTimerEvent()
         session.activePing = true;
         session.messageSocket->sendMessage(Protocol::Common::PING_MESSAGE_ID,
                                            Core::Buffer());
+        // 在发送一个心跳之后，马上schedule下一次心跳发送时间，如果在这段时间内没有收到心跳回复，那么
+        // 在这个时间到来时，handleTimerEvent会由于activePing为true而判定心跳超时。
         schedule(session.PING_TIMEOUT_NS);
     } else {
         VERBOSE("ClientSession to %s timed out: didn't get ping reply in "
@@ -198,6 +203,7 @@ ClientSession::Timer::handleTimerEvent()
                 session.address.toString().c_str(),
                 session.numActiveRPCs);
         // Fail all current and future RPCs.
+        // 设置了session的errorMessage，该session后续的所有handleTimerEvent事件都会在最开始被挡掉。
         session.errorMessage = ("Server " +
                                 session.address.toString() +
                                 " timed out");
@@ -269,6 +275,7 @@ ClientSession::ClientSession(Event::Loop& eventLoop,
     // According to the spec, connect() could return OK done here, but in
     // practice it'll return EINPROGRESS.
     bool waiting = false;
+    // 尝试socket连接上目标server。
     int r = connectFn(fd,
                       address.getSockAddr(),
                       address.getSockAddrLen());
@@ -287,6 +294,7 @@ ClientSession::ClientSession(Event::Loop& eventLoop,
         }
     }
 
+    // 前面创建socket时是SOCK_NONBLOCK也就是TCP连接过程非阻塞，所以connectFn会返回EINPROGRESS，然后进入下面的if分支
     if (waiting) {
         // This is a pretty heavy-weight method of watching a file descriptor
         // for a given period of time. On the other hand, it's only a few lines
@@ -298,7 +306,10 @@ ClientSession::ClientSession(Event::Loop& eventLoop,
         Event::Timer::Monitor timerMonitor(loop, timerNotifier);
         timerNotifier.scheduleAbsolute(timeout);
         while (true) {
+            // 创建一个临时的Event loop然后epoll监听Event::File和Event::Timer两个事件，分别
+            // 用于监听socket connect是否完成以及connect超时检测，其中一个事件到来就会exit loop然后判断connect情况。
             loop.runForever();
+            // 1. connect先完成了，继续判断是否连接成功。
             if (fileNotifier.count > 0) {
                 int error = 0;
                 socklen_t errorlen = sizeof(error);
@@ -313,6 +324,7 @@ ClientSession::ClientSession(Event::Loop& eventLoop,
                 }
                 break;
             }
+            // 2. connect先超时了，直接设置errorMessage后退出。
             if (Clock::now() > timeout) {
                 errorMessage = Core::StringUtil::format(
                     "Failed to connect socket to %s: timeout expired",
@@ -327,6 +339,9 @@ ClientSession::ClientSession(Event::Loop& eventLoop,
         return;
     }
 
+    // 前面调用connectFn方法通过socket连接上目标server之后，就可以为该server创建一个MessageSocket实例，用于监听receive和send事件（这里是和server端共用一套MessageSocket逻辑）。
+    // client节点在session创建时会创建MessageSocket，内部会将sendSocket和receiveSocket两个Event::File加入到epoll内监听。
+    // 需要注意的是，sendSocket的监听事件初始mask为0，只有当真正需要sendmsg的时候再设置监听事件EPOLLOUT|EPOLLONESHOT然后回调执行sendmsg。
     messageSocket.reset(new MessageSocket(
         messageSocketHandler, eventLoop, fd, maxMessageLength));
 }
@@ -377,6 +392,7 @@ ClientSession::~ClientSession()
 OpaqueClientRPC
 ClientSession::sendRequest(Core::Buffer request)
 {
+    // JOEY_TODO: 是否可以利用这个messageId协助做业务层的Timeout幂等
     MessageSocket::MessageId messageId;
     {
         std::lock_guard<std::mutex> mutexGuard(mutex);

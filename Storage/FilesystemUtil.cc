@@ -31,6 +31,7 @@
 
 namespace LogCabin {
 namespace Storage {
+// JOEY_TODO: 做io_uring
 namespace FilesystemUtil {
 
 bool skipFsync = false;
@@ -398,6 +399,8 @@ write(int fildes, const void* data, uint64_t dataLen)
     return write(fildes, {{data, dataLen}});
 }
 
+// 使用writev系统调用搭配iovec使用，可以一次系统调用就把多个不连续buffer中的内容写入文件，
+// 但是writev也会partial write，所以写入过程需要加循环
 ssize_t
 write(int fildes,
        std::initializer_list<std::pair<const void*, uint64_t>> data)
@@ -405,6 +408,7 @@ write(int fildes,
     using Core::Util::downCast;
     size_t totalBytes = 0;
     uint64_t iovcnt = data.size();
+    // iovec中的iov_len只是声明buffer内容的size，不会写入文件，写入文件的只有buffer内容本身
     struct iovec iov[iovcnt];
     uint64_t i = 0;
     for (auto it = data.begin(); it != data.end(); ++it) {
@@ -416,6 +420,7 @@ write(int fildes,
 
     size_t bytesRemaining = totalBytes;
     while (true) {
+        // 执行writev系统调用将数据直接写入内核态page cache文件本体，然后后续的fsync才有效，因为fsync只从内核态page cache拿文件数据
          ssize_t written = System::writev(fildes, iov, downCast<int>(iovcnt));
          if (written == -1) {
              if (errno == EINTR)

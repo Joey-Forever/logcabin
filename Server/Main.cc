@@ -271,12 +271,14 @@ class PidFile {
 
 } // anonymous namespace
 
+// 所有server节点运行二进制程序的启动入口函数
 int
 main(int argc, char** argv)
 {
     using namespace LogCabin;
 
     try {
+        // 该name被一个TLS id映射，所以daemon之后的子进程的主线程也会继承这个thread name
         Core::ThreadId::setName("evloop");
 
         // Parse command line args.
@@ -294,6 +296,8 @@ main(int argc, char** argv)
 
         // Set debug log file
         if (!options.debugLogFilename.empty()) {
+            // 二进制程序启动命令行参数传递了log file，程序运行时的所有log都append
+            // 输出到这个file中。
             std::string error =
                 Core::Debug::setLogFilename(options.debugLogFilename);
             if (!error.empty()) {
@@ -305,7 +309,9 @@ main(int argc, char** argv)
         NOTICE("Using config file %s", options.configFilename.c_str());
 
         // Detach as daemon
+        // 命令行参数指定了程序作为脱离启动终端环境的daemon后台进程运行
         if (options.daemon) {
+            // daemon模式下必须传递log file，否则程序运行时的所有log都将被丢弃
             if (options.debugLogFilename.empty()) {
                 ERROR("Refusing to run as daemon without a log file "
                       "(use /dev/null if you insist)");
@@ -315,18 +321,30 @@ main(int argc, char** argv)
                                 // the user has specified relative paths for
                                 // the config file, etc
             bool close = true;  // close stdin, stdout, stderr
+            // 执行daemon系统调用fork子进程运行在后台，前台的父进程直接退出：
+            //  1.子进程的工作目录保持和父进程一样不变，防止程序中有依赖relative path的代码。
+            //  2.子进程的stdin、stdout、stderr重定向到/dev/null，因此命令行参数必须传递log file。
             if (daemon(!chdir, !close) != 0) {
                 PANIC("Call to daemon() failed: %s", strerror(errno));
             }
+            // daemon系统调用成功之后，运行到这里的就只有后台子进程，子进程的pid不同于启动最初的父进程，
+            // 因此需要更新Core::Debug::processName的值
             int pid = getpid();
             Core::Debug::processName = Core::StringUtil::format("%d", pid);
             NOTICE("Detached as daemon with pid %d", pid);
         }
 
         // Write PID file, removed upon destruction
+        // 如果启动命令行参数指定了pidFile，将pid号写入其中，方便管理员管理该daemon进程
         PidFile pidFile(options.pidFilename);
         pidFile.writePid(getpid());
 
+        //---------------------------------------------------------------------------------------------------------------
+        // daemon模式下，程序到这就顺利运行在了后台了，接下来：
+        // 1. 创建Globals实例，使用启动命令行参数传入的config文件内容初始化globals config
+        // 2. 执行Globals实例init初始化，恢复并启动整个RaftConsensus实例、StateMachine实例、所有网络Services实例等等
+        // 3. bootstrap模式下自举configuration后结束程序，析构Globals实例；正常模式下主线程进入event loop runForever循环，
+        //    server节点正式对外可用，直到event loop被signal exit，再析构Globals实例优雅退出程序
         {
             // Initialize and run Globals.
             Server::Globals globals;
@@ -334,6 +352,7 @@ main(int argc, char** argv)
 
             // Set debug log policy.
             // A few log messages above already got through; oh well.
+            // 根据config文件中的log policy设置程序各模块的日志过滤级别，Administrator后续可以通过rpc运行时reset该server的log policy
             Core::Debug::setLogPolicy(
                 Core::Debug::logPolicyFromString(
                     globals.config.read<std::string>("logPolicy", "NOTICE")));
@@ -345,10 +364,21 @@ main(int argc, char** argv)
                    Core::StringUtil::toString(globals.config).c_str());
             globals.init();
             if (options.bootstrap) {
+                // server节点bootstrap自举启动
+
+                // 命令行参数传递了--bootstrap，用于集群第一个节点第一次启动，调用bootstrapConfiguration
+                // 方法往该节点的本地raft log持久化写入一条term 1的configuration entry log，该配置membership只
+                // 包括该server节点。然后后续正常启动该节点的时候，该节点就可以根据单节点配置成为leader了。
                 globals.raft->bootstrapConfiguration();
                 NOTICE("Done bootstrapping configuration. Exiting.");
             } else {
+                // server节点正常启动
+
+                // ！！！
+                // 在主线程进入event loop执行runForever前要关闭signal blocker的析构时unblock行为，防止
+                // 在globals析构到最后的时候signal unblock导致pending signal执行默认行为导致程序表现为异常退出。
                 globals.leaveSignalsBlocked();
+                // Globals init结束之后，主线程进入event loop循环runForever，直到被signal exit后退出loop随后再执行globals析构
                 globals.run();
             }
         }

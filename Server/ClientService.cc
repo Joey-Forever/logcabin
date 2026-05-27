@@ -104,6 +104,8 @@ ClientService::getServerInfo(RPC::ServerRPC rpc)
     rpc.reply(response);
 }
 
+// leader节点处理client端的read集群当前membership配置的request，client在配置变更之前都需要先getConfiguration，
+// 使用CAS的方式，保证基于最新的集群configuration进行配置变更。
 void
 ClientService::getConfiguration(RPC::ServerRPC rpc)
 {
@@ -131,10 +133,12 @@ ClientService::getConfiguration(RPC::ServerRPC rpc)
     rpc.reply(response);
 }
 
+// leader节点处理client端的集群membership配置变更request
 void
 ClientService::setConfiguration(RPC::ServerRPC rpc)
 {
     PRELUDE(SetConfiguration);
+    // 使用联合共识机制变更集群membership配置
     Result result = globals.raft->setConfiguration(request, response);
     if (result == Result::RETRY || result == Result::NOT_LEADER) {
         Protocol::Client::Error error;
@@ -145,15 +149,23 @@ ClientService::setConfiguration(RPC::ServerRPC rpc)
         rpc.returnError(error);
         return;
     }
+    // 配置变更成功但是新配置不包括本机的话，其实到这里的时候本机已经step down了，但是还是
+    // 要返回给client配置变更成功的response
     rpc.reply(response);
 }
 
+// client 的read-write类状态机命令会 RPC 到这个方法中；follower 也可能收到，
+// 但只有 leader 会真正复制日志，非 leader 会返回 NOT_LEADER。
+// read-write state machine command：包括 open session、close session、tree mkdir/write/remove、advance version。这类操作会修改复制状态机状态，必须走 Raft
 void
 ClientService::stateMachineCommand(RPC::ServerRPC rpc)
 {
+    // 1. 解析出业务请求
     PRELUDE(StateMachineCommand);
     Core::Buffer cmdBuffer;
     rpc.getRequest(cmdBuffer);
+    // 2. 如果当前节点是 leader，将请求复制到本地raft log以及远端多数派；
+    // 非 leader 会在这里返回 NOT_LEADER。
     std::pair<Result, uint64_t> result = globals.raft->replicate(cmdBuffer);
     if (result.first == Result::RETRY || result.first == Result::NOT_LEADER) {
         Protocol::Client::Error error;
@@ -166,17 +178,30 @@ ClientService::stateMachineCommand(RPC::ServerRPC rpc)
     }
     assert(result.first == Result::SUCCESS);
     uint64_t logIndex = result.second;
+    // 3. 本command的log已经确认commit，现在等待该log最终被apply到state machine后构造rpc response
     if (!globals.stateMachine->waitForResponse(logIndex, request, response)) {
+        // !!!
+        // 如果leader在apply一条state machine command的时候state machine是某个runningVersion，
+        // 说明这个runningVersion必然已经被apply，说明这个runningVersion必然已经commit。其他follower
+        // 节点可以不需要此时实时的runningVersion和leader保持一致。但是他的commit log必然和leader保持一致，
+        // 也就意味着follower节点未来apply到同一条state machine command的时候，state machine runningVersion
+        // 必然会apply成和leader现在的一样，进而对同一条state machine command的apply进行和leader现在情况一样的
+        // 约束。
+        // 因此，如果leader此时在apply这条state machine command的时候的结果是invalid request，那么其他follower
+        // 节点后续也必然是invalid request，从而不会真正apply这条command。所以leader在这里直接返回invalid request
+        // 给client是全集群的共识，其他follower节点在apply这条command时也会是这个结果。
         rpc.rejectInvalidRequest();
         return;
     }
     rpc.reply(response);
 }
 
+// read-only state machine query：包括读文件、读目录等这类client的所有只读查询。只需要先等本节点状态机 apply 到 leader 当前 commit index，然后直接查本地状态机，不需要走raft。
 void
 ClientService::stateMachineQuery(RPC::ServerRPC rpc)
 {
     PRELUDE(StateMachineQuery);
+    // 阻塞性获取当前节点的足够新的能够满足当前read操作的commitIndex
     std::pair<Result, uint64_t> result = globals.raft->getLastCommitIndex();
     if (result.first == Result::RETRY || result.first == Result::NOT_LEADER) {
         Protocol::Client::Error error;
@@ -189,12 +214,18 @@ ClientService::stateMachineQuery(RPC::ServerRPC rpc)
     }
     assert(result.first == Result::SUCCESS);
     uint64_t logIndex = result.second;
+    // 在真正前往state machine执行read操作之前，需要先等待state machine至少apply到了目标的commitIndex，
+    // 这样才能确保不会stale read。
     globals.stateMachine->wait(logIndex);
     if (!globals.stateMachine->query(request, response))
+        // read-only请求在当前运行的代码版本中无法被识别
         rpc.rejectInvalidRequest();
     rpc.reply(response);
 }
 
+// 对端client在TCP连接上本机之后，会发送一个verify request过来，该方法就是该request的处理方法，
+// 用于检测此次连接是否有效，如果verify不通过，对方会收到response not ok并将ClientSession返回一个ErrorSession，
+// verify失败后后续对端Client拿到的error session无法再和本机进行rpc了
 void
 ClientService::verifyRecipient(RPC::ServerRPC rpc)
 {
@@ -205,8 +236,10 @@ ClientService::verifyRecipient(RPC::ServerRPC rpc)
 
     if (!clusterUUID.empty())
         response.set_cluster_uuid(clusterUUID);
+    // server本地必然有serverId，这是启动初始化时必须从config文件中读取的
     response.set_server_id(serverId);
 
+    // 以自己本地记录到的clusterUUID和serverId为基准，检测是否和对方client认为的有冲突
     if (request.has_cluster_uuid() &&
         !request.cluster_uuid().empty() &&
         !clusterUUID.empty() &&
@@ -226,7 +259,9 @@ ClientService::verifyRecipient(RPC::ServerRPC rpc)
            request.server_id(),
            serverId));
     } else {
+        // 自己本地的值（如果有）和对端client认为的值（如果有）没有冲突
         response.set_ok(true);
+        // server本地的clusterUUID可能为空，如果对端有，那就以对方的值来填充本地的值
         if (clusterUUID.empty() &&
             request.has_cluster_uuid() &&
             !request.cluster_uuid().empty()) {

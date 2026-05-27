@@ -130,6 +130,9 @@ void
 Signal::handleFileEvent(uint32_t events)
 {
     struct signalfd_siginfo info;
+    // ！！！
+    // 在执行handleSignalEvent自定义任务之前，必须先将signal fd中的内容全部read消费掉，否则
+    // epoll_wait会被反复唤醒
     ssize_t s = read(fd, &info, sizeof(struct signalfd_siginfo));
     if (s < 0) {
         PANIC("Could not read signal info (to discard): %s",
@@ -138,6 +141,7 @@ Signal::handleFileEvent(uint32_t events)
     if (size_t(s) != sizeof(struct signalfd_siginfo)) {
         PANIC("Could not read full signal info (to discard)");
     }
+    // 直接执行自定义的signal event，信号原本的默认行为不会再被触发
     handleSignalEvent();
 }
 

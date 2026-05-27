@@ -37,6 +37,7 @@ namespace Storage {
  * Typically, implementations will persist the log entries and metadata to
  * stable storage (but MemoryLog keeps it all in volatile memory).
  */
+// 不是一个独立并发对象，任何线程访问Log实例只能通过RaftConsensus实例进入，因此其被 RaftConsensus 的大锁统一保护，不需要自己的锁。
 class Log {
   public:
     /**

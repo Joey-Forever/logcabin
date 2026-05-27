@@ -40,6 +40,7 @@ OpaqueServer::MessageSocketHandler::MessageSocketHandler(OpaqueServer* server)
 {
 }
 
+// 和ClientSession的handleReceivedMessage相对，用于处理client发送过来的消息。
 void
 OpaqueServer::MessageSocketHandler::handleReceivedMessage(
         MessageId messageId,
@@ -49,6 +50,7 @@ OpaqueServer::MessageSocketHandler::handleReceivedMessage(
         return;
     switch (messageId) {
         case Protocol::Common::PING_MESSAGE_ID: {
+            // client发送过来的是一个RPC层的ping心跳，直接回复一个相同类型的pong消息即可。
             std::shared_ptr<SocketWithHandler> socketRef = self.lock();
             if (socketRef) { // expect so, since we're receiving messages
                 VERBOSE("Responding to ping");
@@ -134,15 +136,18 @@ OpaqueServer::BoundListener::BoundListener(
 {
 }
 
+// 一直监听，只要有新client请求连接该server，就会触发该方法。
 void
 OpaqueServer::BoundListener::handleFileEvent(uint32_t events)
 {
+    // 1. 获取请求连接的client fd。
     int clientfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK|SOCK_CLOEXEC);
     if (clientfd < 0) {
         PANIC("Could not accept connection on fd %d: %s",
               fd, strerror(errno));
     }
 
+    // 2. 为该client连接创建一个MessageSocket实例，用于监听send和receive事件（这里是和client端共用一套MessageSocket逻辑）。
     server.sockets.insert(SocketWithHandler::make(&server, clientfd));
 }
 
@@ -246,6 +251,7 @@ OpaqueServer::bind(const Address& listenAddress)
     }
 
     std::lock_guard<Core::Mutex> lock(boundListenersMutex);
+    // 往deque内插入一个新建的BoundListenerWithMonitor，monitor构造时往epoll内增加一个Event::File，用于监听client的连接请求。
     boundListeners.emplace_back(*this, fd);
     return "";
 }

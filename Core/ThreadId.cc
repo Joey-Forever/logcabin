@@ -28,6 +28,9 @@ namespace Internal {
  * Thread-specific data holds the identifier for each thread.  It starts off
  * zero, but is set to a non-zero unique value the first time it is accessed.
  */
+// 线程局部变量，每个线程都有自己的副本，通过这种方式，实现了不依赖系统能力对thread进行区分。
+// 使用daemon创建的后台子进程由于复制了父进程的完整地址空间，所以子进程的主线程也会复制父进程调用fork的那个线程的TLS，
+// 所以daemon之后的子进程的主线程的TLS id和父进程的主线程一样。
 __thread uint64_t id = 0;
 
 /**

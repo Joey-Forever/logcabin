@@ -660,6 +660,8 @@ class Configuration {
      * A map from server ID to Server of every server, including the local,
      * previous, new, and staging servers.
      */
+    // knownServers是按照serverId唯一标识一个节点的，所以一个历史节点重新被加入集群，
+    // 不可以复用旧的serverId，必须开一个新serverId，否则会让configuration误判。
     std::unordered_map<uint64_t, ServerRef> knownServers;
 
   public:
@@ -1567,6 +1569,16 @@ class RaftConsensus {
      *      After setting this value, you must call updateLogMetadata() to
      *      persist it.
      */
+    // ！！！！
+    // 集群的每一个合法leader的term都是随新任而单调递增的，通过严格单增的term，raft保证了：
+    // 如果一个节点获得leader，那么集群的多数派就必然在对应term下votefor了这个节点，
+    // 如果其他节点发起选举，term < leader term时会拿不到多数派/被stepdown中止选举，term == leader term
+    // 时就是拿不到多数派，term > leader term时他有机会得到多数派选票并且成为新leader，
+    // 这时旧leader发心跳时就会得不到多数派ack甚至由于看到更高的term而主动step down，从而维护更高term leader
+    // 的唯一性。
+    // 所有server节点必须时刻保证currentTerm >= log max term这个不变量，也就是，只有当本机已知的term已经达到了某个值，
+    // 本地raft log才应该出现该term的log。换种说法，本地raft log的term达到了某个值，说明本机已经和该term leader建立过
+    // 联系，那么本机currentTerm就不应该小于该term值。
     uint64_t currentTerm;
 
     /**
@@ -1624,6 +1636,10 @@ class RaftConsensus {
      * this server's log are guaranteed to never change. This value will
      * monotonically increase over time.
      */
+    // ！！！！
+    // commitIndex所指的log及其之前的所有log都已经被复制到多数派，不可能再被修改，是安全的，已经是集群共识。
+    // leader是首先知晓最新commitIndex的节点，随后心跳到follower进行同步。但是如果leader发生
+    // 重选举，新leader会默认自己本地的log都是允许commit的，新leader会继续完成该log的多数派复制并commit，即使此前的leader未commit该log。
     uint64_t commitIndex;
 
     /**
@@ -1641,6 +1657,11 @@ class RaftConsensus {
      *      After setting this value, you must call updateLogMetadata() to
      *      persist it.
      */
+    // 这个值指的是在当前term内本机投票给了谁，而不是当前term本机已知的leader是谁，
+    // 如果在当前term本机并没有做出投票操作，该值会一直保持0，当前term的leader发heartbeat
+    // 过来时也不会设置该值，只有两种情况该值会不为0：
+    //   1. 本机发起新选举时投票给自己
+    //   2. 收到其他candidate拉票时投票给其他server
     uint64_t votedFor;
 
     /**
@@ -1679,6 +1700,13 @@ class RaftConsensus {
      * is received, and it's set to infinity for leaders (who begin processing
      * RequestVote messages again immediately when they step down).
      */
+    // ！！！
+    // 事实上，这个变量并不能完全解决健康leader被step down的问题。他能解决的是，当一个节点短暂断联之后（因此term和log都是最新的）的主动选举
+    // 不会获得多数派选票，但是无法避免该节点仍然递增了其本地的term，这就导致虽然该节点无法主动抢占leader身份，但是后续现任leader给他发heartbeat
+    // 时仍然会由于其虚高的term而被拉下台。而要彻底解决这个问题，还需要搭配pre-vote机制，在节点无法确定能拿到多数票时不会递增本地term，从而避免虚高。
+    //   1）withholdVotesUntil保证在leader健康时身份不会被其他节点抢占
+    //   2）pre-vote确保在节点主动选举拿不到多数票时不会盲目递增本地term
+    //   3）两者缺一不可，才能根治"disruptive servers"问题
     TimePoint withholdVotesUntil;
 
     /**

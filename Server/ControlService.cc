@@ -139,6 +139,9 @@ ControlService::debugPolicyGet(RPC::ServerRPC rpc)
     rpc.reply(response);
 }
 
+// 当排查线上问题时需要更多线上诊断日志时，client端可以rpc过来通过
+// 这个方法reset log policy，然后日志中就可以出现更详细的诊断日志了，
+// 这也是为什么release时不能将低级别的日志直接编译掉。
 void
 ControlService::debugPolicySet(RPC::ServerRPC rpc)
 {

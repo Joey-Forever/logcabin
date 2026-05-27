@@ -51,6 +51,8 @@ class StateMachine {
     typedef Protocol::Client::StateMachineCommand Command;
     typedef Protocol::Client::StateMachineQuery Query;
 
+    // 这里的support version其实指的是StateMachine类实现的代码版本，例如新版本代码新增了一个state machine的命令，就需要将MAX_SUPPORTED_VERSION改高比如3，
+    // 然后当一个server节点重启运行这个新版本代码时，就会知道当前运行的代码版本是3，代码中是可以识别那个新增的state machine命令的。
     enum {
         /**
          * This state machine code can behave like all versions between
@@ -435,6 +437,7 @@ class StateMachine {
      * Snapshots that are requested due to this flag are permitted to begin
      * even if automated snapshots have been inhibited with #setInhibit().
      */
+    // 提供给Administrator远程触发server节点打新snapshot，该设置true后可以无视所有其他检测，马上执行snapshot
     bool isSnapshotRequested;
 
     /**
@@ -442,6 +445,7 @@ class StateMachine {
      * Normally this is set to some time in the past. When automated snapshots
      * are inhibited with #setInhibit(), this will be set to a future time.
      */
+    // 提供给Administrator远程控制server节点的打新snapshot时机
     TimePoint maySnapshotAt;
 
     /**

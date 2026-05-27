@@ -44,6 +44,8 @@ void
 Globals::ExitHandler::handleSignalEvent()
 {
     NOTICE("%s: shutting down", strsignal(signalNumber));
+    // 主线程在epoll_wait被SIGINT、SIGTERM这些终止信号唤醒后最后会执行到这里对event loop设置shouldExit为true，
+    // 然后event loop就会退出runForever循环，最后引起Globals实例的析构，完成程序的安全退出。
     eventLoop.exit();
 }
 
@@ -74,10 +76,15 @@ Globals::Globals()
     : config()
     , serverStats(*this)
     , eventLoop()
+    // 1. 设置几个主要信号的blocker，用于将信号进行block，使得信号能够被加到epoll中被捕捉，由于blocker在Globals类中最早被声明：
+    //   1）Globals构造最开始信号就会被block，后续所有新创建的线程都会继承这些信号的block，防止有的线程绕过epoll直接接收并执行了信号的默认行为。
+    //   2）Globals析构最后blocker才会析构并执行可能的unblock，防止过早unblock导致信号绕过epoll直接执行默认行为。
     , sigIntBlocker(SIGINT)
     , sigTermBlocker(SIGTERM)
     , sigUsr1Blocker(SIGUSR1)
     , sigUsr2Blocker(SIGUSR2)
+    // 2. 将几个被block的信号以fd形式以EPOLLIN可读的方式加入epoll中，后续有信号过来epoll_wait被唤醒的时候，需要从fd中将内容read消费掉，防止
+    //    epoll_wait反复被同一个信号触发，然后再执行自定义任务即可（例如析构流程），信号默认的行为不会再触发。
     , sigIntHandler(eventLoop, SIGINT)
     , sigIntMonitor(eventLoop, sigIntHandler)
     , sigTermHandler(eventLoop, SIGTERM)
@@ -100,12 +107,16 @@ Globals::~Globals()
     serverStats.exit();
 }
 
+// 1. 完成三个rpc服务的注册，占用指定的socket监听端口
+// 2. init RaftConsensus对象
+// 3. 创建 stateMachine对象
 void
 Globals::init()
 {
     std::string uuid = config.read("clusterUUID", std::string(""));
     if (!uuid.empty())
         clusterUUID.set(uuid);
+    // 一个server节点启动初始化的时候，config文件中必须要有serverId
     serverId = config.read<uint64_t>("serverId");
     Core::Debug::processName = Core::StringUtil::format("%lu", serverId);
     {
@@ -130,6 +141,7 @@ Globals::init()
     }
 
     if (!rpcServer) {
+        // rpcServer是Globals类定义中最后一个声明的，所以在析构的时候会首先析构，即比stateMachine实例和raft实例要早。
         rpcServer.reset(new RPC::Server(eventLoop,
                                         Protocol::Common::MAX_MESSAGE_LENGTH));
 
@@ -162,6 +174,7 @@ Globals::init()
              ++it) {
             RPC::Address address(*it, Protocol::Common::DEFAULT_PORT);
             address.refresh(RPC::Address::TimePoint::max());
+            // 这里会触发socket端口占用并且马上开始监听client的连接请求。
             std::string error = rpcServer->bind(address);
             if (!error.empty()) {
                 EXIT("Could not listen on address %s: %s",
@@ -176,9 +189,12 @@ Globals::init()
     }
 
     if (!stateMachine) {
+        // 创建构造state machine实例，同时创建相关后台线程
         stateMachine.reset(new StateMachine(raft, config, *this));
     }
 
+    // 使能server stat的周期性打log，以及通过远程获取server stat，
+    // 这能让开发者能够获取关于这台server节点的实时运行情况，包括raft consensus、state machine、log、snapshot等等所有状态数据
     serverStats.enable();
 }
 
