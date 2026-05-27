@@ -297,6 +297,8 @@ ClientImpl::ExactlyOnceRPCHelper::doneWithRPC(
     doneWithRPC(rpcInfo, Core::HoldingMutex(lockGuard));
 }
 
+// Client执行每个写操作时都需要先ExactlyOnceRPCHelper::getRPCInfo，而读操作则不需要，
+// 因此OpenSession以及keepAliveThread的启动都是在getRPCInfo中执行。
 Protocol::Client::ExactlyOnceRPCInfo
 ClientImpl::ExactlyOnceRPCHelper::getRPCInfo(
         Core::HoldingMutex holdingMutex,
@@ -355,6 +357,9 @@ ClientImpl::ExactlyOnceRPCHelper::doneWithRPC(
     outstandingRPCNumbers.erase(rpcInfo.rpc_number());
 }
 
+// 每个ClientImpl实例对应一个后台线程持续执行该方法，用于保活raft log中对应的唯一openSession，
+// 其中会定期发一个带 exactly_once 信息的 no-op 状态机命令，让 server 更新 session 的 lastModified。
+// ！！需要注意的是，这里保活的是openSession本身，防止server由于一个session长时间没有请求而将其清理，和RPC层ping心跳保活的是TCP连接本身不一样，
 void
 ClientImpl::ExactlyOnceRPCHelper::keepAliveThreadMain()
 {
@@ -387,6 +392,7 @@ ClientImpl::ExactlyOnceRPCHelper::keepAliveThreadMain()
             {
                 // release lock to allow concurrent cancellation
                 Core::MutexUnlock<Core::Mutex> unlockGuard(lockGuard);
+                // JOEY_TODO：设置有效timeout值，防止reponse丢失时保活线程永久等待
                 callStatus = keepAliveCall->wait(response, TimePoint::max());
             }
             keepAliveCall.reset();

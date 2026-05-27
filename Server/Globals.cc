@@ -100,6 +100,9 @@ Globals::~Globals()
     serverStats.exit();
 }
 
+// 1. 完成三个rpc服务的注册，占用指定的socket监听端口
+// 2. init RaftConsensus对象
+// 3. 创建 stateMachine对象
 void
 Globals::init()
 {
@@ -162,6 +165,7 @@ Globals::init()
              ++it) {
             RPC::Address address(*it, Protocol::Common::DEFAULT_PORT);
             address.refresh(RPC::Address::TimePoint::max());
+            // 这里会触发socket端口占用并且马上开始监听client的连接请求。
             std::string error = rpcServer->bind(address);
             if (!error.empty()) {
                 EXIT("Could not listen on address %s: %s",

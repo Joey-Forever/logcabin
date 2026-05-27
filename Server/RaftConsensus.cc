@@ -166,6 +166,7 @@ Peer::Peer(uint64_t serverId, RaftConsensus& consensus)
     , exiting(false)
     , requestVoteDone(false)
     , haveVote_(false)
+    // 新加入configuration的Peer在实例构造时需要保证suppressBulkData、nextIndex、matchIndex三个值的设置和beginLeadership方法中的一致
     , suppressBulkData(true)
       // It's somewhat important to set nextIndex correctly here, since peers
       // that are added to the configuration won't go through beginLeadership()
@@ -201,6 +202,11 @@ Peer::beginRequestVote()
     haveVote_ = false;
 }
 
+// 当一个server成为新Leader时就会调用已知所有Peer的该方法，主要设置三个关键值：
+// 1. nextIndex设置到新Leader自身的last log index + 1，其实是在乐观猜测peer server的log同步状态，如果猜测不正确，
+//    首次发送appendEnties时会fail然后会得到peer返回的其本地log真正的last log index用来纠正。
+// 2. matchIndex设置为0，因为新leader并不知道peer节点的本地log match到哪里了，而且保证peerThreadMain后台线程马上就可以触发appendEnties。
+// 3. suppressBulkData设置为true，保证首次发送的appendEntries是不携带任何log数据的heartBeat request。
 void
 Peer::beginLeadership()
 {
@@ -451,6 +457,7 @@ Configuration::SimpleConfiguration::min(const GetValue& getValue) const
     return smallest;
 }
 
+// 只有当多数派都是true时才返回true
 bool
 Configuration::SimpleConfiguration::quorumAll(const Predicate& predicate) const
 {
@@ -463,6 +470,7 @@ Configuration::SimpleConfiguration::quorumAll(const Predicate& predicate) const
     return (count >= servers.size() / 2 + 1);
 }
 
+// 返回value数值最大的多数派中最小的那个值
 uint64_t
 Configuration::SimpleConfiguration::quorumMin(const GetValue& getValue) const
 {
@@ -488,6 +496,7 @@ Configuration::Configuration(uint64_t serverId, RaftConsensus& consensus)
     , newServers()
 {
     localServer.reset(new LocalServer(serverId, consensus));
+    // 还没从raft log中读取任何configuration，初始KnownServers只有自己，即LocalServer
     knownServers[serverId] = localServer;
 }
 
@@ -550,6 +559,7 @@ Configuration::resetStagingServers()
     if (state == State::STAGING) {
         // staging servers could have changed other servers' addresses, so roll
         // back to old description with old addresses
+        // staging state下的configuration的id和description仍然保持此前的stable状态，这里直接可以回退
         setConfiguration(id, description);
     }
 }
@@ -576,6 +586,9 @@ Configuration::reset()
     knownServers[localServer->serverId] = localServer;
 }
 
+// 将一个从raft log中读取到的new configuration（newId对应raft log中的entry id）设置为本地已知的集群membership config：
+//  1. 将new configuration中涉及到的所有server加入KnownServers列表，并分别启动一个peerThreadMain线程
+//  2. 为KnownServers列表中不存在于new configuration中的peerThreadMain线程执行exit
 void
 Configuration::setConfiguration(
         uint64_t newId,
@@ -628,17 +641,22 @@ Configuration::setConfiguration(
     }
 }
 
+// leader节点将本地的stable configuration设置成staging state，该方法只会将configuration实例的
+// 的new_servers列表进行填充为传入servers，不会修改id和description，new_servers后续也暂时不会参与quorum。
 void
 Configuration::setStagingServers(
         const Protocol::Raft::SimpleConfiguration& stagingServers)
 {
+    // configuration此前的state必须得是stable
     assert(state == State::STABLE);
     state = State::STAGING;
     for (auto it = stagingServers.servers().begin();
          it != stagingServers.servers().end();
          ++it) {
+        // getServer方法会为每个新来的server节点新建一个peer线程，用于后续与该server节点的各类网络通信活动。
         std::shared_ptr<Server> server = getServer(it->server_id());
         server->addresses = it->addresses();
+        // 此前stable state的newServers列表为空，这里会将传入的stagingServers列表填充进去。
         newServers.servers.push_back(server);
     }
 }
@@ -723,6 +741,7 @@ operator<<(std::ostream& os, const Configuration& configuration)
 
 ////////// Configuration private methods //////////
 
+// 从config中每读取一个knownServers中没有的peer server节点，就会为该peer server启动一个peerThreadMain。
 std::shared_ptr<Server>
 Configuration::getServer(uint64_t newServerId)
 {
@@ -930,6 +949,7 @@ RaftConsensus::Entry::~Entry()
 
 ////////// RaftConsensus //////////
 
+// JOEY_TODO: 做multi-raft，做batching/pipelining
 RaftConsensus::RaftConsensus(Globals& globals)
     : ELECTION_TIMEOUT(
         std::chrono::milliseconds(
@@ -1052,6 +1072,8 @@ RaftConsensus::init()
 
     NOTICE("Reading the log");
     if (!log) { // some unit tests pre-set the log; don't overwrite it
+        // 1. 构造SegmentLog实例，触发raft log的启动恢复，解析本机磁盘中的metadata文件元数据（主要是logStartIndex、term、voted_for）
+        //    以及segment文件的所有log entry到内存结构中
         log = Storage::LogFactory::makeLog(globals.config, storageLayout);
     }
     for (uint64_t index = log->getLogStartIndex();
@@ -1063,6 +1085,7 @@ RaftConsensus::init()
                   "found on disk",
                   index, entry.term());
         }
+        // 2. 遍历segment log中的所有entry，挑出其中的所有configuration类型的entry，保存到ConfigurationManager中，然后不断将本地configuration设置到Index最新的那个
         if (entry.type() == Protocol::Raft::EntryType::CONFIGURATION) {
             configurationManager->add(index, entry.configuration());
         }
@@ -1070,6 +1093,7 @@ RaftConsensus::init()
 
     // Restore cluster time epoch from last log entry, if any
     if (log->getLastLogIndex() >= log->getLogStartIndex()) {
+        // 3. 根据恢复出来的raft log，将最后的log entry的cluster time更新clusterClock
         clusterClock.newEpoch(
             log->getEntry(log->getLastLogIndex()).cluster_time());
     }
@@ -1077,6 +1101,7 @@ RaftConsensus::init()
     NOTICE("The log contains indexes %lu through %lu (inclusive)",
            log->getLogStartIndex(), log->getLastLogIndex());
 
+    // 4. 根据恢复出来的metadata信息，将term和voted_for更新到内存状态，然后再持久化一次metadata文件
     if (log->metadata.has_current_term())
         currentTerm = log->metadata.current_term();
     if (log->metadata.has_voted_for())
@@ -1085,16 +1110,20 @@ RaftConsensus::init()
 
     // Read snapshot after reading log, since readSnapshot() will get rid of
     // conflicting log entries
+    // 5. 解析本机最新的snapshot header，该操作会以snapshot作为基准，可能会
+    //    对raft log进行截断、更新logStartIndex、更新commitedIndex、更新clusterClock、更新内存configuration信息等等。
     readSnapshot();
 
     // Clean up incomplete snapshots left by prior runs. This could be done
     // earlier, but maybe it's nicer to make sure we can get to this point
     // without PANICing before deleting these files.
+    // 6. 清除所有没有完整生成的partial snapshot文件
     Storage::SnapshotFile::discardPartialSnapshots(storageLayout);
 
     if (configuration->id == 0)
         NOTICE("No configuration, waiting to receive one.");
 
+    // JOEY_TODO: 看到这里
     stepDown(currentTerm);
     if (RaftConsensusInternal::startThreads) {
         leaderDiskThread = std::thread(
@@ -1163,6 +1192,7 @@ RaftConsensus::getConfiguration(
     std::unique_lock<Mutex> lockGuard(mutex);
     if (!upToDateLeader(lockGuard))
         return ClientResult::NOT_LEADER;
+    // 只有当当前leader本地configuration已经stable并且已commit，才会返回id号给client
     if (configuration->state != Configuration::State::STABLE ||
         commitIndex < configuration->id) {
         return ClientResult::RETRY;
@@ -1259,6 +1289,16 @@ RaftConsensus::getSnapshotStats() const
     return s;
 }
 
+// 需要考虑rpc request重复发送时的写幂等
+// 处理来自leader(可能是旧leader，需要判断term)的appendEntries请求.
+// !!!
+// folower的该方法与leader的appendEntries方法相配合，达到了一个效果：
+//  1）如果一条entry冲突，那么其后续的所有entry都冲突
+//  2）如果一条entry正确，那么其前面的所有entry都正确
+//  由于冲突的entries必然在某一时刻处于follower的log的suffix中，而leader给follower发送正确的entries前会去猜测follower的最后正确log同步点，
+//  由于同步点和实际的lastLogIndex间不能留gap，且leader会从follower的lastLogIndex逐一回退来找正确的同步点，因此最后的正确同步点必然是
+//  落在follower的尾部冲突entries之前的某个正确entry中，而trancateSuffix机制保证了在append正确entry之前follower尾部冲突entries必然已被全部截断，
+//  也就保证了follower不会出现正确的entry之间夹着冲突entry的情况了。（当然这依赖leader本身发送过来的entries都是正确的）
 void
 RaftConsensus::handleAppendEntries(
                     const Protocol::Raft::AppendEntries::Request& request,
@@ -1269,11 +1309,14 @@ RaftConsensus::handleAppendEntries(
 
     // Set response to a rejection. We'll overwrite these later if we end up
     // accepting the request.
+    // 1. 先构造一个reject的response内容，带上自己所认的leader term以及本地raft log的lastLogIndex，
+    //    如果后续真的需要拒绝时会返回给leader协助其做一些判断依据。
     response.set_term(currentTerm);
     response.set_success(false);
     response.set_last_log_index(log->getLastLogIndex());
 
     // Piggy-back server capabilities.
+    // 2. 顺便带上自己本地的state machine版本区间。
     {
         auto& cap = *response.mutable_server_capabilities();
         auto& s = *configuration->localServer;
@@ -1286,6 +1329,7 @@ RaftConsensus::handleAppendEntries(
     }
 
     // If the caller's term is stale, just return our term to it.
+    // 3. 自己本地的leader term比request中的大，说明发request的为旧leader，直接reject。
     if (request.term() < currentTerm) {
         VERBOSE("Caller(%lu) is stale. Our term is %lu, theirs is %lu",
                  request.server_id(), currentTerm, request.term());
@@ -1299,6 +1343,10 @@ RaftConsensus::handleAppendEntries(
         // 'response' accordingly.
         response.set_term(request.term());
     }
+    // ！！！
+    // 4. 发request的leader的term >= 本地的term，说明本机认可该leader的身份了，该请求将视为该leader的一个保活信号，然后做两件事：
+    //     1）本机stepDown为Follower然后更新本机的term为request中的更新term值
+    //     2）leader心跳有效，重置本地的选举发起时间以及重置拒绝其余server选举请求的时间窗口
     // This request is a sign of life from the current leader. Update
     // our term and convert to follower if necessary; reset the
     // election timer. set it here in case request we exit the
@@ -1308,6 +1356,7 @@ RaftConsensus::handleAppendEntries(
     withholdVotesUntil = Clock::now() + ELECTION_TIMEOUT;
 
     // Record the leader ID as a hint for clients.
+    // 5. 记录认可的该leader的serverId，可以作为后续给请求到本机的client的重定向提示。
     if (leaderId == 0) {
         leaderId = request.server_id();
         NOTICE("All hail leader %lu for term %lu", leaderId, currentTerm);
@@ -1317,6 +1366,7 @@ RaftConsensus::handleAppendEntries(
     }
 
     // For an entry to fit into our log, it must not leave a gap.
+    // 6. leader猜测本机的本地log同步点错误了，会留gap，直接reject
     if (request.prev_log_index() > log->getLastLogIndex()) {
         VERBOSE("Rejecting AppendEntries RPC: would leave gap");
         return; // response was set to a rejection above
@@ -1327,6 +1377,7 @@ RaftConsensus::handleAppendEntries(
     // since we know those were committed, the leader must agree with them.
     // We could truncate the log here, but there's no real advantage to doing
     // that.
+    // 7. leader猜测本机的本地log同步点错误了，猜测的Index仍有冲突，直接reject
     if (request.prev_log_index() >= log->getLogStartIndex() &&
         log->getEntry(request.prev_log_index()).term() !=
             request.prev_log_term()) {
@@ -1335,6 +1386,8 @@ RaftConsensus::handleAppendEntries(
     }
 
     // If we got this far, we're accepting the request.
+    // ！！！
+    // 8. leader成功猜对了本机的本地log同步点（同步点落在了必然正确的snaoshot内，或对应index的entry log term一致），可以respnse success
     response.set_success(true);
 
     // This needs to be able to handle duplicated RPC requests. We compare the
@@ -1353,6 +1406,10 @@ RaftConsensus::handleAppendEntries(
     // acknowledged data is safe. However, there is a window of vulnerability
     // on the follower's disk between the truncate and append operations (which
     // are not done atomically) when the follower processes the later request.
+    // 9. 然后将request中携带的log entry追加到本地的raft log中。
+    //    ！！！需要注意的是，leader发送的appendEntries request和client发送的statemachine command使用的是相同的rpc机制，因此handle函数在处理写请求时需要保证幂等
+    //    ！！！（不能假设request不会重复到达，或者不能假设两个request的entry内容完全没有重复），在client request中，这种重试在server端有state machine中的session表
+    //    ！！！来保证写操作的exactly once语义，而对于appendEnries request，raft log的持久化充当了该语义的保证机制，而follower在执行entry追加时需要做详细的去重检测以保证append操作的exactly once。
     uint64_t index = request.prev_log_index();
     for (auto it = request.entries().begin();
          it != request.entries().end();
@@ -1367,11 +1424,16 @@ RaftConsensus::handleAppendEntries(
         if (index < log->getLogStartIndex()) {
             // We already snapshotted and discarded this index, so presumably
             // we've received a committed entry we once already had.
+            // 10. entry已经被包含在本机的snapshot中，直接跳过。
             continue;
         }
         if (log->getLastLogIndex() >= index) {
             if (log->getEntry(index).term() == entry.term())
+                // 12. entry在本地raft log的范围内，且与对应index的entry重复，直接跳过
                 continue;
+            // 13. entry在本地raft log的范围内，但是对应index的entry与其冲突，直接truncate本地log的suffix部分，
+            //     !!!需要注意的是，必须要找到精确的冲突index再执行截断，否则对已经持久化的正确log进行截断的话，一旦机器在截断之后append之前发生崩溃，将导致作为多数派的本机数据丢失，
+            //     !!!虽然本机是follower，但是这会破坏多数派的备份假设，一旦leader突然不可用，选出来的新leader恰好是发生了这种崩溃的follower的话，将导致集群的数据丢失。
             // should never truncate committed entries:
             assert(commitIndex < index);
             uint64_t lastIndexKept = index - 1;
@@ -1384,6 +1446,8 @@ RaftConsensus::handleAppendEntries(
             configurationManager->truncateSuffix(lastIndexKept);
         }
 
+        assert(index == (log->getLastLogIndex() + 1));
+        // 14. 经历了前面的去重以及截断后，有效的request entry index来到了本地raft log的lastLogIndex + 1位置，将request中当前及后续的所有entry追加进本地raft log中。
         // Append this and all following entries.
         std::vector<const Protocol::Raft::Entry*> entries;
         do {
@@ -1406,6 +1470,7 @@ RaftConsensus::handleAppendEntries(
         clusterClock.newEpoch(entries.back()->cluster_time());
         break;
     }
+    // 15. 新entry可能已经append进本地raft log，response中的lastLogIndex也要更新。
     response.set_last_log_index(log->getLastLogIndex());
 
     // Set our committed ID from the request's. In rare cases, this would make
@@ -1413,6 +1478,12 @@ RaftConsensus::handleAppendEntries(
     // leader who has not yet replicated one of its own entries. While that'd
     // be perfectly safe, guarding against it with an if statement lets us
     // make stronger assertions.
+    // 16. 如果request中的commitIndex大于本地值，则推进本地Index，然后唤醒其他后台线程例如apply statemachine线程。
+    //     ！！！需要注意的是，我们为了保持commitIndex的单增性质，需要保证request中的值确实大于本地值才更新，考虑一种时序：
+    //     ！！！旧leader把entry复制到多数派commit到10之后，给follower a发心跳，a也commit到了10，但是在给follower b发
+    //     ！！！心跳之前旧leader就挂了，b的commit index只到了8，但是b本地确实作为多数派有了完整的log的，然后后面b首先发起
+    //     ！！！选举并且顺利当选新leader，就出现了新leader b的commitIndex暂时落后follower a的情况，新leader b在发给a的首个
+    //     ！！！心跳请求中request commideIndex就会小于a的本地值。
     if (commitIndex < request.commit_index()) {
         commitIndex = request.commit_index();
         assert(commitIndex <= log->getLastLogIndex());
@@ -1422,10 +1493,15 @@ RaftConsensus::handleAppendEntries(
 
     // reset election timer to avoid punishing the leader for our own
     // long disk writes
+    // 17. 执行log append的磁盘操作前已经重置过一次选举计时器，但是这里需要再重置一次，因为leader的心跳需要等到前一个appendRequest回来才能发，如果
+    //     follower自己由于长时间disk操作耽误了leader的及时心跳导致自己本地提前触发了选举，会造成对leader的不利。 
     setElectionTimer();
     withholdVotesUntil = Clock::now() + ELECTION_TIMEOUT;
 }
 
+// 需要考虑rpc request重复发送时的写幂等
+// 处理leader发送过来的installSnapshot请求。
+// ！！！在snapshot被完整接收之前，partial临时文件都是随时可以被删除的，leader的peer matchIndex也不会被更新。
 void
 RaftConsensus::handleInstallSnapshot(
         const Protocol::Raft::InstallSnapshot::Request& request,
@@ -1466,12 +1542,15 @@ RaftConsensus::handleInstallSnapshot(
     }
 
     if (!snapshotWriter) {
+        // 1. snapshotWriter实例构造时会创建一个name带有partial字段的临时写入文件，然后持有该文件的一个file descriptor，用于接收后续的snapshot chunk写入。
+        //    该实例是和某一指定term leader的snapshot发送流程绑定的，一旦term发生改变，这个实例会在stepdown的时候被discard。
         snapshotWriter.reset(
             new Storage::SnapshotFile::Writer(storageLayout));
     }
     response.set_bytes_stored(snapshotWriter->getBytesWritten());
 
     if (request.byte_offset() < snapshotWriter->getBytesWritten()) {
+        // 2. request chunk旧了，本地已有，直接抛弃
         WARNING("Ignoring stale snapshot chunk for byte offset %lu when the "
                 "next byte needed is %lu",
                 request.byte_offset(),
@@ -1479,6 +1558,7 @@ RaftConsensus::handleInstallSnapshot(
         return;
     }
     if (request.byte_offset() > snapshotWriter->getBytesWritten()) {
+        // 3. request chunk和follower已经写入的部分有gap，先不写入
         WARNING("Leader tried to send snapshot chunk at byte offset %lu but "
                 "the next byte needed is %lu. Discarding the chunk.",
                 request.byte_offset(),
@@ -1499,11 +1579,16 @@ RaftConsensus::handleInstallSnapshot(
         }
         return;
     }
+    // 4. request chunck恰好接在follower已经写入的部分后，可以写入。
+    //    ！！！需要注意的是，这里写入并不会触发fsync磁盘操作，因为在snapshot完整接收到之前，
+    //    ！！！partial文件都是可抛弃的，没有必要sync，leader也不会在snapshot完整被接收
+    //    ！！！之前更新peer matchIndex。
     snapshotWriter->writeRaw(request.data().data(), request.data().length());
     response.set_bytes_stored(snapshotWriter->getBytesWritten());
 
     if (request.done()) {
         if (request.last_snapshot_index() < lastSnapshotIndex) {
+            // 5. snapshot文件完整被接收了，但是比follower本地已有的snapshot还旧，直接删除
             WARNING("The leader sent us a snapshot, but it's stale: it only "
                     "covers up through index %lu and we already have one "
                     "through %lu. A well-behaved leader shouldn't do that. "
@@ -1515,13 +1600,22 @@ RaftConsensus::handleInstallSnapshot(
             return;
         }
         NOTICE("Loading in new snapshot from leader");
+        // 6. snapshot文件完整被接收了，并且比follower本地的要新，save取代旧snapshot
         snapshotWriter->save();
         snapshotWriter.reset();
+        // 7. 执行readSnapshot，将新snapshot的信息加载进follower本地
         readSnapshot();
+        // 8. 唤醒某些线程执行任务
         stateChanged.notify_all();
+        // 9. 和handleAppendEntries同理，save操作和readSnapshot操作都涉及磁盘同步操作，需要
+        //    重置本地的选举计时器防止对leader不利。
+        setElectionTimer();
+        withholdVotesUntil = Clock::now() + ELECTION_TIMEOUT;
     }
 }
 
+// 需要考虑rpc request重复发送时的写幂等
+// 处理来自Candidate节点的拉票request
 void
 RaftConsensus::handleRequestVote(
                     const Protocol::Raft::RequestVote::Request& request,
@@ -1533,10 +1627,14 @@ RaftConsensus::handleRequestVote(
     // If the caller has a less complete log, we can't give it our vote.
     uint64_t lastLogIndex = log->getLastLogIndex();
     uint64_t lastLogTerm = getLastLogTerm();
+    // 1. 比较candidate的log和本机本地log谁更新，last term越大越新，term相同，last index越大越新
     bool logIsOk = (request.last_log_term() > lastLogTerm ||
                     (request.last_log_term() == lastLogTerm &&
                      request.last_log_index() >= lastLogIndex));
 
+    // ！！！
+    // 2. 最近一段时间刚刚收到leader的heartbeat，说明现任leader健康，不管candidate的拉票term值是多少，都直接拒绝投票。
+    //    该判断可以避免健康的leader被异常节点的新选举拉下台，但是无法阻止异常节点在选举失败后仍然单增其本地的term值。
     if (withholdVotesUntil > Clock::now()) {
         NOTICE("Rejecting RequestVote for term %lu from server %lu, since "
                "this server (which is in term %lu) recently heard from a "
@@ -1549,6 +1647,8 @@ RaftConsensus::handleRequestVote(
         return;
     }
 
+    // 3. 如果candidate的拉票term大于本机的term，本机无条件stepdown为follower，并且如果本机自己也处于candidate状态，
+    //    stepdown时也会终止自身的选举流程。
     if (request.term() > currentTerm) {
         NOTICE("Received RequestVote request from server %lu in term %lu "
                "(this server's term was %lu)",
@@ -1560,14 +1660,24 @@ RaftConsensus::handleRequestVote(
     // However, this is just an optimization that does not affect correctness
     // or really even efficiency, so it's not worth the trouble.
 
+    // 4. 这里有个需要注意的点，如果candidate的拉票term在本机进行stepdown前就相等，那么本机的当前状态可能有两种：
+    //   1）candidate状态，那么此时本机的votefor必然是自己，也就不会投票给其他server
+    //   2）follower状态，即使本机的voteFor为0，投给了这个candidate，由于每个term下只有一个candidate能够拿到多数派，最终该term下也只有一个leader，但是本机的votefor可能和实际leader不一致，这是raft允许的
     if (request.term() == currentTerm) {
         if (logIsOk && votedFor == 0) {
             // Give caller our vote
+            // 5. candidate的log足够新并且本机在该term下没有voteFor，可以投票给该candidate
             NOTICE("Voting for %lu in term %lu",
                    request.server_id(), currentTerm);
+            // 6. 确认投票时再次stepdown一下保证本机为follower了，顺便interruptAll正在进行的peer rpc活动，当前更多是防御措施，如果后面引入pre vote的话，这个stepdown就有实际意义。
             stepDown(currentTerm);
+            // 7. 重置本机选举计时器，给voteFor节点一点时间收集多数派选票成为leader后发heartbeat，避免自己刚投完票马上又发起新选举。
             setElectionTimer();
             votedFor = request.server_id();
+            // ！！！
+            // 8. 在确认投票的rpc response发送回去给candidate之前，必须先将本机的term+voteFor持久化到metadata文件，这里有两种崩溃情况：
+            //    1）如果本机在持久化后发送response前崩溃，最多就是集群的投票损失一票，最差情况就是谁也拿不到多数派选票，后续重新发起新选举即可
+            //    2）如果本机在response后崩溃，由于本机已经持久化投票信息，后续也不会出现重复投票的情况
             updateLogMetadata();
             printElectionState();
         }
@@ -1576,6 +1686,7 @@ RaftConsensus::handleRequestVote(
     // Fill in response.
     response.set_term(currentTerm);
     // don't strictly need the first condition
+    // 9. 本机的term为candidate的拉票term并且本机voteFor为该candidate的serverId，则投票成功
     response.set_granted(request.term() == currentTerm &&
                          votedFor == request.server_id());
     response.set_log_ok(logIsOk);
@@ -1591,6 +1702,38 @@ RaftConsensus::replicate(const Core::Buffer& operation)
     return replicateEntry(entry, lockGuard);
 }
 
+// 该方法是leader节点处理client的集群配置变更请求。
+// ！！！
+// 配置变更是最容易造成脑裂的，如果直接将stable new configuration复制到新集群而不考虑旧集群的话，考虑以下情况：
+// 当前集群的leader作为新集群的临时leader负责向新集群多数派写入stable new configuration，在将stable new configuration复制到
+// 新集群的时候，leader突然断线，这时候旧集群节点和新集群节点会分别按照自己本地的configuration发起选举拉票，
+// 这时候新集群的已经有stable new configuration的节点会获得新集群的leader，而旧集群的节点还是根据旧配置选出旧集群的leader，
+// 这样就导致了一个raft组产生了两个leader，即脑裂。
+// 因此需要一个机制，保证旧集群能够根据旧配置独立选出leader的情况下，新集群选出的合法leader必然还要经过旧集群的多数派投票，否则选不出leader，新集群
+// 能够根据新配置独立选出leader的情况下，旧集群选出的合法leader必然还要经过新集群的多数派投票，否则选不出leader。这就是联合共识。
+// 为了实现联合共识，raft在配置变更时，先后引入了三种configuration state：
+//   1）staging state：该配置状态不会进入raft log。该状态下，新集群节点作为leader的follower不断接收来自leader的log entry，直到其复制追赶速率达到了
+//                     leader的append新增速率，leader就认为该follower成功caught up。这个过程中的所有新增append log都不需要来自新集群的共识。
+//   2）transitional state：该配置状态会同时记录旧集群(prev)和新集群(next)的membership信息进入一条raft log。当新集群节点全部都caught up之后，
+//                          就会进入该状态。该状态下，所有的append log（包括transitional state log）不仅会复制到新旧集群，而且commit也需要同
+//                          时获得来自新旧集群的共识。
+//   3）stable state：该配置状态只记录新集群的membership信息进入一条raft log。当leader本地advanceCommitIndex（需要新旧集群联合共识）到
+//                    transitional state log index的时候，就会进入该状态。该状态下，所有的append log（包括stable state log）只会复制到新集群，
+//                    commit也只需要来自新集群的共识。当该stable state log被leader确认commit后，如果leader不属于新集群，leader就会stepDown，
+//                    随后新集群节点根据新配置选出自己的独立leader。至此集群配置就算成功变更了。
+/////////////////////////////////////////////////////////////////////////////////////////
+// 因此，raft解决脑裂的联合共识机制中发挥主要作用的就是transitional state这个中间状态。只有当transitional state log被同时写进新集群和旧集群的多数派
+// 后，真正的stable state log才会被写入新集群节点。考虑三种leader的崩溃时机：
+//   1）如果stable state log成功commit，新集群节点可以单独根据新配置选出新集群的独立leader，而旧集群节点发起选举时要么是连transitional state log
+//      都没有的少数派落后节点，要么是含有transitional state log的多数派发起选举时必须同时获得来自新集群的多数派共识（事实上，由于新集群的多数派已经
+//      含有stable state log，而旧集群所有节点都不含有stable state log，所以新集群多数派的log必然比旧集群的任意一个节点都要新，因此旧集群节点发起的
+//      新选举不可能获得来自新集群的多数派共识）。
+//   2）如果只有transactional state log成功commit而stable state log没有成功commit，那么后续新旧集群的任意胜选新leader都必然同时获得了两边的共识，
+//      然后新的leader作为两边的共同leader继续配置变更操作。（或者新集群的含有stable state log的少数派节点直接发起选举并胜选，这就回到1）的情况了，只是
+//      新集群并没有stable state log的多数派复制，所以旧集群节点还是有可能获得来自新集群的共识并胜选，但是也会和新集群的独立leader选举冲突，导致最后
+//      两边只能选出一个leader）
+//   3）如果transitional state log也没有commit成功，旧集群节点可能可以单独根据旧配置选出旧集群的独立leader，而新集群不含有该log的节点会在发起新选
+//      举时被本地挡住（历史membership不含有新节点id），含有该log的新集群节点在发起新选举时必然需要同时获取来自旧集群的共识。
 RaftConsensus::ClientResult
 RaftConsensus::setConfiguration(
         const Protocol::Client::SetConfiguration::Request& request,
@@ -1600,10 +1743,14 @@ RaftConsensus::setConfiguration(
 
     if (exiting || state != State::LEADER) {
         // caller fills out response
+        // 2. configuration变更需要append log进入raft log，所以只能通过leader节点执行
         return ClientResult::NOT_LEADER;
     }
     if (configuration->id != request.old_id()) {
         // configurations has changed in the meantime
+        // JOEY_TODO: 是否可以启蒙下state machine写请求的CAS？
+        // 3. 由于server允许并发处理client的任何请求，所以会出现一个配置变更还在执行中，又有另一个请求过来，这里直接根据old_id做CAS，
+        //    client在发起setConfiguration前需要先通过getConfiguration获取当前的stable configuration id。
         response.mutable_configuration_changed()->set_error(
             Core::StringUtil::format(
                 "The current configuration has ID %lu (no longer %lu) "
@@ -1614,6 +1761,8 @@ RaftConsensus::setConfiguration(
         return ClientResult::FAIL;
     }
     if (configuration->state != Configuration::State::STABLE) {
+        // 4. 只有当前的配置已经是stable state了（getConfiguration逻辑保证，如果client拿到了当前stable config id，说明当前stable必然是commited的），
+        //    才允许新的配置变更，进一步排除有其他配置变更流程正在执行的可能性。
         response.mutable_configuration_changed()->set_error(
             Core::StringUtil::format(
                 "The current configuration (%lu) is not stable (it's %s)",
@@ -1636,44 +1785,57 @@ RaftConsensus::setConfiguration(
         s->set_server_id(it->server_id());
         s->set_addresses(it->addresses());
     }
+    // 5. 将configuration state设置成staging state，为每个新来的server节点新建一个peer线程，并填充configuration new_servers列表,
+    //    staging state不会进raft log。
     configuration->setStagingServers(nextConfiguration);
     stateChanged.notify_all();
 
     // Wait for new servers to be caught up. This will abort if not every
     // server makes progress in a ELECTION_TIMEOUT period.
+    // 6. 新配置中的节点已经通过各自的peer线程开始同步leader的log，当前leader心跳至新节点时会促使其stepdown为follower，
+    //    然后leader将作为新集群节点的临时leader负责后续的完整配置变更流程
     uint64_t term = currentTerm;
+    // 7. 开新epoch，设置checkProgressAt超时检测，用于定时检查是否所有新节点都没有断线以及持续和leader保持进展。直到所有新节点都caught up。
     ++currentEpoch;
     uint64_t epoch = currentEpoch;
     TimePoint checkProgressAt = Clock::now() + ELECTION_TIMEOUT;
     while (true) {
         if (exiting || term != currentTerm) {
+            // 8. 等待新节点caught up期间leader失去了身份，直接终止配置变更（resetStagingServers在之前stepdown的时候就做了）
             NOTICE("Lost leadership, aborting configuration change");
             // caller will fill in response
             return ClientResult::NOT_LEADER;
         }
         if (configuration->stagingAll(&Server::isCaughtUp)) {
+            // 9. 所有新节点都已经caught up，可以进入配置变更的下一步了
             NOTICE("Done catching up servers");
             break;
         }
         if (Clock::now() >= checkProgressAt) {
+            // 10. 线程被超时唤醒了，直接检查是否这段时间内所有新节点都保持了进展
             using RaftConsensusInternal::StagingProgressing;
             StagingProgressing progressing(epoch, response);
             if (!configuration->stagingAll(progressing)) {
+                // 11. 通过检查lastAckEpoch得知，有的新节点在这段时间内没有获得任何进展，直接终止配置变更
                 NOTICE("Failed to catch up new servers, aborting "
                        "configuration change");
+                // 12. 将本地configuration回滚回此前的stable state（id和description未改变）
                 configuration->resetStagingServers();
                 stateChanged.notify_all();
                 // progressing filled in response
                 return ClientResult::FAIL;
             } else {
+                // 13. 所有新节点都在顺利保持进展，开新epoch并重置超时检测，继续等待caught up
                 ++currentEpoch;
                 epoch = currentEpoch;
                 checkProgressAt = Clock::now() + ELECTION_TIMEOUT;
             }
         }
+        // 14. sleep放锁等待新节点caught up，或者超时起来检查进展。
         stateChanged.wait_until(lockGuard, checkProgressAt);
     }
 
+    // 15. staging state下所有新节点都已经成功caught up了，可以进行下一步transitional state。
     // Write and commit transitional configuration
     NOTICE("Writing transitional configuration entry");
     Protocol::Raft::Configuration newConfiguration;
@@ -1683,9 +1845,12 @@ RaftConsensus::setConfiguration(
     Log::Entry entry;
     entry.set_type(Protocol::Raft::EntryType::CONFIGURATION);
     *entry.mutable_configuration() = newConfiguration;
+    // 16. 将transitional state log追加至leader本地raft log，等待本地fsync并复制给多数派quorum。leader本地配置会首先激活为transitional state，
+    //     由于transitional state是联合共识，所以该state下所有log（包括transitional state log本身）都需要同时获得来自新集群和旧集群的共识。
     std::pair<ClientResult, uint64_t> result =
         replicateEntry(entry, lockGuard);
     if (result.first != ClientResult::SUCCESS) {
+        // 17. 线程结束等待时，transitional state log没有获得多数派quorum，直接终止配置变更
         NOTICE("Failed to commit transitional configuration entry, aborting "
                "configuration change (%s)",
                Core::StringUtil::toString(result.first).c_str());
@@ -1705,10 +1870,17 @@ RaftConsensus::setConfiguration(
     // Wait until the configuration that removes the old servers has been
     // committed. This is the first configuration with ID greater than
     // transitionalId.
+    // 18. transitional state log被成功复制到了多数派quorum然后被leader成功推进commitIndex，
+    //     并且此前在advanceCommitIndex时leader已经通过append方法触发将stable state log追加到了本地log
+    //     以及激活了本地configuration为stable state，并触发了本地异步fsync以及复制到多数派quorum（stable状态
+    //     下quorum只会需要新集群共识，log也只会复制到新集群）。
+    //     当前线程只需要继续等待stable state log quorum ok并commit，就完成了配置变更流程。
     NOTICE("Waiting for stable configuration to commit");
     while (true) {
         // Check this first: if the new configuration excludes us so we've
         // stepped down upon committing it, we still want to return success.
+        // 19. 如果本机configuration已经至少激活到了transitionalId之后，并且本机的commitIndex至少推进到了当前configuration id，
+        //     说明当前配置变更流程的stable state已经被成功commit。此时无论本地是否还是leader，都应该返回配置变更成功。
         if (configuration->id > transitionalId &&
             commitIndex >= configuration->id) {
             response.mutable_ok();
@@ -1716,6 +1888,7 @@ RaftConsensus::setConfiguration(
                    "completed successfully");
             return ClientResult::SUCCESS;
         }
+        // 20. 如果stable state log尚未commit但本机却丢失了leader身份，直接终止配置变更，返回操作结果不确定的“Not Leader” response给client。
         if (exiting || term != currentTerm) {
             NOTICE("Lost leadership");
             // caller fills in response
@@ -1936,6 +2109,7 @@ operator<<(std::ostream& os, const RaftConsensus& raft)
 
 
 //// RaftConsensus private methods that MUST acquire the lock
+//// 以下private方法都是某一个后台线程的执行函数，会和从public方法进来的外界线程互斥访问成员变量，所以必须加锁。
 
 void
 RaftConsensus::stateMachineUpdaterThreadMain()
@@ -2053,6 +2227,9 @@ RaftConsensus::leaderDiskThreadMain()
     }
 }
 
+// ！！！！（Leader节点heartbeat + Leader节点定时stepdown检测 + Follower/Candidate节点定时选举检测，raft通过该机制保证了集群leader的持续活性）
+// Follower节点和Candidate节点通过该后台线程定时发起新选举，只有当Leader节点不断heartbeat过来
+// 重置本机选举超时时间，才能避免新选举的发生。
 void
 RaftConsensus::timerThreadMain()
 {
@@ -2065,6 +2242,7 @@ RaftConsensus::timerThreadMain()
     }
 }
 
+// peerThreadMain线程需要保证始终持有Peer实例的shared引用，防止configuration随时发生变化时Peer实例exit后被销毁，导致peerThreadMain线程无法访问peer
 void
 RaftConsensus::peerThreadMain(std::shared_ptr<Peer> peer)
 {
@@ -2080,6 +2258,7 @@ RaftConsensus::peerThreadMain(std::shared_ptr<Peer> peer)
         TimePoint waitUntil = TimePoint::min();
 
         if (peer->backoffUntil > now) {
+            // 上一次rpc的时候FAILED了，为了避免对方网络/cpu被打满，需要等待一段时间，此时等待时间还没到。
             waitUntil = peer->backoffUntil;
         } else {
             switch (state) {
@@ -2119,6 +2298,11 @@ RaftConsensus::peerThreadMain(std::shared_ptr<Peer> peer)
     NOTICE("Peer thread for server %lu exiting", peer->serverId);
 }
 
+// ！！！！（Leader节点heartbeat + Leader节点定时stepdown检测 + Follower/Candidate节点定时选举检测，raft通过该机制保证了集群leader的持续活性）
+// Leader节点通过该后台线程定时开新epoch+检测ackEpoch，只有当Leader发出去的对应epoch的heartbeat能得到集群多数派ack的时候，
+// 检测才会通过，从而避免本机stepdown为Follower。
+// 该后台线程用于leader节点通过定时开新epoch并检测ackEpoch的方式确认leader身份是否仍被集群多数派承认，如果检测失败将直接stepdown放弃leader身份。
+// ！！！需要注意的是，心跳并不是这里发的，心跳由appendEntries定时发，这里只是定时检测ackEpoch。
 void
 RaftConsensus::stepDownThreadMain()
 {
@@ -2134,12 +2318,17 @@ RaftConsensus::stepDownThreadMain()
                 // If this local server forms a quorum (it is the only server
                 // in the configuration), we need to sleep. Without this guard,
                 // this method would not relinquish the CPU.
+                // 1. 先开新epoch
                 ++currentEpoch;
+                // 2. 有两种情况：
+                //   1）本机已知configuration是单节点集群，该方法的所有ackEpoch检测都将自动成立，会导致该线程一直空转占据cpu，所以需要这个if判断迫使本机sleep到下面的stateChanged信号量中。
+                //   2）本机已知configuration是多节点集群，以下的ackEpoch检测必然失败（因为当前线程还拿着锁，新epoch的心跳必然还没发），也即if为true，这时候直接break进入后续的正式quorumMin。
                 if (configuration->quorumMin(&Server::getLastAckEpoch) <
                     currentEpoch) {
                     break;
                 }
             }
+            // 3. 非leader节点/已知为单节点集群，该线程一直sleep
             stateChanged.wait(lockGuard);
         }
         // Now, if an election timeout goes by without confirming leadership,
@@ -2147,28 +2336,34 @@ RaftConsensus::stepDownThreadMain()
         // since it's about when other servers will start elections and bump
         // the term.
         TimePoint stepDownAt = Clock::now() + ELECTION_TIMEOUT;
+        // 4. sleep等待心跳确认期间是放锁的，所以要先记录保存当前的term和epoch。
         uint64_t term = currentTerm;
         uint64_t epoch = currentEpoch; // currentEpoch was incremented above
         while (true) {
             if (exiting)
                 return;
             if (currentTerm > term)
+                // 5. sleep期间term变化了，放弃检测ackEpoch
                 break;
             if (configuration->quorumMin(&Server::getLastAckEpoch) >= epoch)
+                // 6. ackEpoch检测通过证明leader身份仍然被集群多数派认可，继续执行下一轮检测
                 break;
             if (Clock::now() >= stepDownAt) {
+                // 7. 超时时间内没有收到多数派ack认可，leader身份已不保，直接stepdown放弃leader身份，并且将本地term + 1
                 NOTICE("No broadcast for a timeout, stepping down from leader "
                        "of term %lu (converting to follower in term %lu)",
                        currentTerm, currentTerm + 1);
                 stepDown(currentTerm + 1);
                 break;
             }
+            // 8. 放锁sleep直到被唤醒或者超时唤醒
             stateChanged.wait_until(lockGuard, stepDownAt);
         }
     }
 }
 
 //// RaftConsensus private methods that MUST NOT acquire the lock
+//// 以下private方法只被public方法或者带锁的private方法调用，所以不能带锁。
 
 void
 RaftConsensus::advanceCommitIndex()
@@ -2181,6 +2376,9 @@ RaftConsensus::advanceCommitIndex()
     }
 
     // calculate the largest entry ID stored on a quorum of servers
+    // 所有raft节点共同参与多数派验证：
+    // --对于leader节点来说，getMatchIndex() 返回 lastSyncedIndex，也即是本地log sync成功。
+    // --对于远端peer follower节点来说，getMatchIndex() 返回 matchIndex，也即是AppendEntries返回成功。
     uint64_t newCommitIndex =
         configuration->quorumMin(&Server::getMatchIndex);
     if (commitIndex >= newCommitIndex)
@@ -2190,16 +2388,23 @@ RaftConsensus::advanceCommitIndex()
     assert(newCommitIndex >= log->getLogStartIndex());
     // At least one of these entries must also be from the current term to
     // guarantee that no server without them can be elected.
+    // 只有当多数派的matchIndex对应的term达到了当前leader的currentTerm，leader才能够推进commitIndex，避免committed log后续又被覆盖（参考becomeLeader方法中append no-op log的作用）
     if (log->getEntry(newCommitIndex).term() != currentTerm)
         return;
     commitIndex = newCommitIndex;
     VERBOSE("New commitIndex: %lu", commitIndex);
     assert(commitIndex <= log->getLastLogIndex());
+    // commit Index成功推进了，这里主要是为了唤醒state machine的applyThreadMain后台线程，让他执行apply操作；
+    // 其次是唤醒rpc service线程，让他进入waitForResponse。
     stateChanged.notify_all();
 
+    // leader已经成功推动一个configuration复制到了多数派后成功commit，该configuration已经事实上成为了集群共识，
+    // 可以根据configuration类型继续配置变更的下一步操作。
     if (state == State::LEADER && commitIndex >= configuration->id) {
         // Upon committing a configuration that excludes itself, the leader
         // steps down.
+        // 1. 一般新commit的是stable configuration时，如果新配置确实不包含leader本机，leader需要主动stepdown，
+        //    然后新集群节点会根据新配置membership重新发起选举选出新leader。
         if (!configuration->hasVote(configuration->localServer)) {
             NOTICE("Newly committed configuration does not include self. "
                    "Stepping down as leader");
@@ -2209,6 +2414,9 @@ RaftConsensus::advanceCommitIndex()
 
         // Upon committing a reconfiguration (Cold,new) entry, the leader
         // creates the next configuration (Cnew) entry.
+        // 2. 新commit的是transitional configuration时，说明新旧集群都达成了联合共识状态，
+        //    leader本地log可以追加并激活stable configuration，然后触发往新集群多数派复制
+        //    stable configuration（注意这里不会再复制到旧集群多数派）。
         if (configuration->state == Configuration::State::TRANSITIONAL) {
             Log::Entry entry;
             entry.set_term(currentTerm);
@@ -2236,39 +2444,62 @@ RaftConsensus::append(const std::vector<const Log::Entry*>& entries)
         log->syncComplete(std::move(sync));
     }
     uint64_t index = range.first;
+    // ！！！！
+    // 在本地已知一个新的configuration entry之时，需要立即激活该configuration，用于后续的log复制、quorum计算以及peer管理，
+    // 本地先基于新的configuration做这些工作，并不会影响集群已有共识，反而这是后续这个configuration能够成功被committed的基础，
+    // 但是在这个configuration被复制到多数派再commit之前，都是可以被覆盖的，这意味着本地激活的该configuration最终未能成为集群共识。
     for (auto it = entries.begin(); it != entries.end(); ++it) {
         const Log::Entry& entry = **it;
         if (entry.type() == Protocol::Raft::EntryType::CONFIGURATION)
             configurationManager->add(index, entry.configuration());
         ++index;
     }
+    // 对于leader节点来说，log被append到本地（但是没sync）之后，会设置logSyncQueued = true以及更新LastLogIndex，
+    // 然后notify_all会唤醒leaderDiskThread以及各个peer thread。
+    // leaderDiskThreadMain 看到 logSyncQueued == true，就把 leader 本地尚未 sync 的 log 刷到稳定存储。
+    // peerThread 看到 peer.matchIndex < log->getLastLogIndex()，就给对应 follower 发 AppendEntries。
+    // ！！所以leader本地sync和复制到多数派实际上是并行进行的。
+    // 需要注意的是，这里其实state machine的applyThreadMain这个后台线程也会也唤醒，只是在commitIndex被成功推进之前，他不会执行apply而是会继续睡眠。
     stateChanged.notify_all();
 }
 
+// 这个方法由Leader节点调用，兼顾了Leader向Folower发送的三种信息：
+// 1. 正常发送本地的raft log entry
+// 2. 作为入口触发installSnapshot向follower发送snapshot
+// 3. 周期性发送heartbeat信号确保自身的Leader身份
 void
 RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
                              Peer& peer)
 {
     uint64_t lastLogIndex = log->getLastLogIndex();
+    // 1. Leader首先推测Follower的log同步点在prevLogIndex处
     uint64_t prevLogIndex = peer.nextIndex - 1;
     assert(prevLogIndex <= lastLogIndex);
 
     // Don't have needed entry: send a snapshot instead.
     if (peer.nextIndex < log->getLogStartIndex()) {
+        // 2. 这种情况对应于Leader本地raft log的nextIndex对应entry已经在生成snapshot的时候被截断，
+        //    Leader无法再提供单条log entry，只能直接发送snapshot
         installSnapshot(lockGuard, peer);
         return;
     }
 
     // Find prevLogTerm or fall back to sending a snapshot.
+    // 3. term值是校验两副raft log在相同的index下的log entry内容是否相同的标识，
+    //    因此必须获取prevLogTerm以确认Follower的log同步点是否就是prevLogIndex
     uint64_t prevLogTerm;
     if (prevLogIndex >= log->getLogStartIndex()) {
+        // 1）当prevLogIndex处于Leader本地raft log区间时，直接访问对应log entry取term
         prevLogTerm = log->getEntry(prevLogIndex).term();
     } else if (prevLogIndex == 0) {
+        // 2）follower从未从Leader处同步过任何log，term直接赋0
         prevLogTerm = 0;
     } else if (prevLogIndex == lastSnapshotIndex) {
+        // 3）当prevLogIndex是Leader的lastSnapshotIndex时，直接读取lastSnapshotTerm
         prevLogTerm = lastSnapshotTerm;
     } else {
         // Don't have needed entry for prevLogTerm: send snapshot instead.
+        // 4）prevLogIndex log entry已经被snapshot截断，无法通过访问单条log entry获取term，只能直接发送snapshot
         installSnapshot(lockGuard, peer);
         return;
     }
@@ -2280,13 +2511,22 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
     request.set_prev_log_term(prevLogTerm);
     request.set_prev_log_index(prevLogIndex);
     uint64_t numEntries = 0;
+    // 4. suppressBulkData这个变量用于Leader决定当前是否应该携带log数据发送Follower RPC：
+    //   1）当某次RPC的时候收到RPC failed（可能RPC ping心跳超时说明可能与Follower断连了），这个值会设置为true从而抑制下次RPC携带log数据，只做心跳探测；
+    //   2）当某次RPC的时候获得了Follower的response success，说明Leader已经获取到了Follower的log同步点，这个值会设置为false
+    //      从而允许下次RPC从同步点开始携带log数据进行发送。
+    //   3）其余情况该值则继续保持旧值进行作用。
     if (!peer.suppressBulkData)
         numEntries = packEntries(peer.nextIndex, request);
+    // 5. 告知Follower他应该推进commitIndex到什么位置，Follower的commitIndex不能超过Leader的值
     request.set_commit_index(std::min(commitIndex, prevLogIndex + numEntries));
 
     // Execute RPC
     Protocol::Raft::AppendEntries::Response response;
     TimePoint start = Clock::now();
+    // 6. leader发送rpc之前先记录currentEpoch，后续如果收到follower的leader acknowledge response时，就更新peer的lastAckEpoch为该值，
+    //    表示peer在该epoch内是认可当前leader的。
+    //    ！！！注意，这个epoch必须在rpc发送之前记录，保证follower的leader ack是在leader对应的read-only操作开始（线性化点）之后再由follower发出的。
     uint64_t epoch = currentEpoch;
     Peer::CallStatus status = peer.callRPC(
                 Protocol::Raft::OpCode::APPEND_ENTRIES,
@@ -2296,6 +2536,7 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
         case Peer::CallStatus::OK:
             break;
         case Peer::CallStatus::FAILED:
+            // 7. RPC Failed了，设置backoffUntil让在一段时间内不再发送rpc，并且suppressBulkData设置true以使得下次rpc为不携带数据的探测消息
             peer.suppressBulkData = true;
             peer.backoffUntil = start + RPC_FAILURE_BACKOFF;
             return;
@@ -2305,25 +2546,40 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
     }
 
     // Process response
+    // 8. follower正常接收到rpc request并正常返回response了，处理response
 
     if (currentTerm != request.term() || peer.exiting) {
         // we don't care about result of RPC
+        // 9. 由于rpc等待response期间是放锁的，期间可能发生以下情况，直接return即可：
+        //    1) leader重新选举导致term变化
+        //    2) configuration变更导致peer被移除集群而被exit
         return;
     }
     // Since we were leader in this term before, we must still be leader in
     // this term.
     assert(state == State::LEADER);
     if (response.term() > currentTerm) {
+        // 10. follower认的term比当前term要大，当前server直接stepDown退为Follower
+        //     ！！！需要注意的是，从发起新选举的逻辑可知，response中的这个大term并不一定对应一个
+        //     ！！！有效的leader，可能只是那个server此前长期处于candidate状态重复发起选举导致term不断抬高。
+        //     ！！！而当前leader在stepdown之后，如果这个term的leader确实不存在，那
+        //     ！！！后续会由于心跳缺失而重新发起新选举。
+        //     ！！！这种情况不会影响正确性，但是会由于leader被迫重新选举导致影响可用性
         NOTICE("Received AppendEntries response from server %lu in term %lu "
                "(this server's term was %lu)",
                 peer.serverId, response.term(), currentTerm);
         stepDown(response.term());
     } else {
+        // ！！！
+        // 11. follower认可当前server的LEADER身份了，更新peer的lastAckEpoch，并且唤醒依赖lastAckEpoch进行quorum多数派检查的线程
         assert(response.term() == currentTerm);
         peer.lastAckEpoch = epoch;
         stateChanged.notify_all();
         peer.nextHeartbeatTime = start + HEARTBEAT_PERIOD;
         if (response.success()) {
+            // ！！！
+            // 12. 当前Leader猜测的follower的log同步点正确，且follower已经成功把request中的entry log加到了其本地raft log，
+            //     更新follower的log同步点matchIndex，然后试图推进本地commitIndex
             if (peer.matchIndex > prevLogIndex + numEntries) {
                 // Revisit this warning if we pipeline AppendEntries RPCs for
                 // performance.
@@ -2337,25 +2593,45 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
             peer.nextIndex = peer.matchIndex + 1;
             peer.suppressBulkData = false;
 
+            // 在一个server刚刚加入configuration，Peer在本地初始被创建的时候，需要监测follower的log同步点的caughtUp时机，
+            // 用于RaftConsensus::setConfiguration操作判断何时才能将该server真正加入raft集群中，防止新server由于log同步点太旧
+            // 导致影响集群的多数派检测。
+            // ！！！
+            // 这里判断follower是否caughtUp的依据不是follower必须赶上leader的实时lastLogIndex（或一定阈值内），因为leader的log会一直增长，
+            // 如果要实现这种方式的话，caughtUp将很难成立，从而阻塞该server加入集群的流程，而是判断follower的追赶一段log entry的速率
+            // 是否与leader的产生该段log entry的速率接近（耗时差值绝对值在ELECTION_TIMEOUT内，经验值），只要速率接近，那意味着follower的追赶
+            // 跟上了leader的生产节奏，即使目前log同步仍有差距，但是未来预期是乐观的，可以继续该server加入集群的流程。有两种情况：
+            //   1）leader生产速率 < follower追赶速率，即使暂时两者耗时差值大于ELECTION_TIMEOUT，但是由于follower会
+            //      越来越接近leader的实时lastLogIndex，数轮后耗时差值会很快收敛到ELECTION_TIMEOUT内，然后设置caughtUp true。
+            //   2）leader生产速率 > follower追赶速率，这时候两者的耗时差值可能持续大于ELECTION_TIMEOUT，follower为了赶上leader
+            //      所需要同步的log entry数量越来越多，这时候需要持续开启新一轮的追赶。直到后续某一时刻，leader的生产速率下降或follower
+            //      的追赶速率提升，两者耗时差值将收敛到ELECTION_TIMEOUT内，这时候follower的追赶预期乐观，就可以设置caughtUp true。
             if (!peer.isCaughtUp_ &&
                 peer.thisCatchUpIterationGoalId <= peer.matchIndex) {
+                // 13. follower当前轮的log追赶到达了此前设定的goal，当前轮结束，可以触发“生产-追赶”速率判断
                 Clock::duration duration =
                     Clock::now() - peer.thisCatchUpIterationStart;
+                // thisCatchUpIterationMs是当前轮的follower的追赶耗时；
+                // lastCatchUpIterationMs是上一轮的follower的追赶耗时，也就是leader之前生产当前轮log entry的生产耗时；
                 uint64_t thisCatchUpIterationMs =
                     uint64_t(std::chrono::duration_cast<
                                  std::chrono::milliseconds>(duration).count());
                 if (labs(int64_t(peer.lastCatchUpIterationMs -
                                  thisCatchUpIterationMs)) * 1000L * 1000L <
                     std::chrono::nanoseconds(ELECTION_TIMEOUT).count()) {
+                    // 14. 两者速率接近了，follower追赶预期乐观，caughtUp设置true，并且唤醒RaftConsensus::setConfiguration线程继续执行任务
                     peer.isCaughtUp_ = true;
                     stateChanged.notify_all();
                 } else {
+                    // 15. 两者速率仍有差距，follower追赶预期悲观，需要开启新一轮的追赶，更新goal为leader当前的lastLogIndex
                     peer.lastCatchUpIterationMs = thisCatchUpIterationMs;
                     peer.thisCatchUpIterationStart = Clock::now();
                     peer.thisCatchUpIterationGoalId = log->getLastLogIndex();
                 }
             }
         } else {
+            // 16. 当前Leader猜测的follower的log同步点错误，说明两者的log存在尾部冲突，回退nextIndex，
+            //     下次尝试更早的log entry猜测follower log同步点。
             if (peer.nextIndex > 1)
                 --peer.nextIndex;
             // A server that hasn't been around for a while might have a much
@@ -2365,6 +2641,8 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
             // gap, so it will always be rejected).
             if (response.has_last_log_index() &&
                 peer.nextIndex > response.last_log_index() + 1) {
+                // 17. follower给leader提供了其本地raft log的lastLogIndex，下次尝试可以直接基于该index发送nextIndex，
+                //     从而加速猜测follower log同步点的回退。
                 peer.nextIndex = response.last_log_index() + 1;
             }
         }
@@ -2373,6 +2651,8 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
         auto& cap = response.server_capabilities();
         if (cap.has_min_supported_state_machine_version() &&
             cap.has_max_supported_state_machine_version()) {
+            // 18. 本次response包含了follower支持的stateMachine版本期间，leader需要记录下来，
+            //     然后唤醒stateMachineUpdaterThreadMain后台线程。
             peer.haveStateMachineSupportedVersions = true;
             peer.minStateMachineVersion = Core::Util::downCast<uint16_t>(
                 cap.min_supported_state_machine_version());
@@ -2383,6 +2663,7 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
     }
 }
 
+// 该方法是leader向follower发送自己snapshot的方法，当appendEntries时发现需要发送的entry已经被截断时就会触发该方法。
 void
 RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
                                Peer& peer)
@@ -2396,6 +2677,10 @@ RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
     // Open the latest snapshot if we haven't already. Stash a copy of the
     // lastSnapshotIndex that goes along with the file, since it's possible
     // that this will change while we're transferring chunks).
+    // 1. snapshotFile本质上是保存对于snapshot文件的一个mmap映射 + 一个file descriptor，因为
+    //    rpc期间可能leader新的snashot已经生成，父目录的同名目录项也指向了新的snapshot文件，但是
+    //    只要peer snapshotFile中还hold住fd，正在执行installSnapshot任务的snapshot文件就不会被系统回收。
+    //    记录lastSnapshotIndex也是相同道理。
     if (!peer.snapshotFile) {
         namespace FS = Storage::FilesystemUtil;
         peer.snapshotFile.reset(new FS::FileContents(
@@ -2447,24 +2732,29 @@ RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
 
     if (currentTerm != request.term() || peer.exiting) {
         // we don't care about result of RPC
+        // 2. 等待rpc期间无锁，term可能已经发生改变，peer也可能已经被移出集群
         return;
     }
     // Since we were leader in this term before, we must still be leader in
     // this term.
     assert(state == State::LEADER);
     if (response.term() > currentTerm) {
+        // 3. follower的term更新，leader主动stepdown退位
         NOTICE("Received InstallSnapshot response from server %lu in "
                "term %lu (this server's term was %lu)",
                 peer.serverId, response.term(), currentTerm);
         stepDown(response.term());
     } else {
+        // 4. follower认可了当前leader的身份。
         assert(response.term() == currentTerm);
         peer.lastAckEpoch = epoch;
         stateChanged.notify_all();
         peer.nextHeartbeatTime = start + HEARTBEAT_PERIOD;
+        // 5. follower认可leader身份后会直接写snapshot，而不需要像appendEntries那样还要严格定位log同步点，因为snapshot本身默认都是正确的、已commit的。
         peer.suppressBulkData = false;
         if (response.has_bytes_stored()) {
             // Normal path (since InstallSnapshot version 2).
+            // 6. 根据follower返回的实际已写入byte size更新snapshotFileOffset，而不是靠leader推测
             peer.snapshotFileOffset = response.bytes_stored();
         } else {
             // This is the old path for InstallSnapshot version 1 followers
@@ -2472,16 +2762,21 @@ RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
             // appended to the file if the terms matched.
             peer.snapshotFileOffset += numDataBytes;
         }
+        // 7. 只有当follower已经完整的复制了整个snapshot，才会触发更新peer的matchIndex和nextIndex，为的是
+        //    在snapshot不断发送的过程中，appendEntries能够不断被触发并且总会重定向到installSnapshot方法中。
         if (peer.snapshotFileOffset == peer.snapshotFile->getFileLength()) {
             NOTICE("Done sending snapshot through index %lu to follower",
                    peer.lastSnapshotIndex);
+            // 8. follower的本地log都会失效，全部以刚刚接收到的snapshot为准，所以matchIndex直接就是lastSnapshotIndex即可
             peer.matchIndex = peer.lastSnapshotIndex;
             peer.nextIndex = peer.lastSnapshotIndex + 1;
             // These entries are already committed if they're in a snapshot, so
             // the commitIndex shouldn't advance, but let's just follow the
             // simple rule that bumping matchIndex should always be
             // followed by a call to advanceCommitIndex():
+            // 9. peer matchIndex更新后，按规则触发一次advanceCommitIndex，但实际上leader本地的commitIndex必然早已 >= lastSnapshotIndex，所以这里并不会真正增加leader commitIndex
             advanceCommitIndex();
+            // 10. snapshot已经完成发送，析构snapshotFile实例，这会解映射mmap然后close file descriptor，如果该snapshot此前已经被新snapshot取代目录项，最终会触发系统回收旧snapshot文件
             peer.snapshotFile.reset();
             peer.snapshotFileOffset = 0;
             peer.lastSnapshotIndex = 0;
@@ -2489,6 +2784,7 @@ RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
     }
 }
 
+// candidate节点在获取到多数派选票之后，就会调用该方法成为currentTerm下的leader
 void
 RaftConsensus::becomeLeader()
 {
@@ -2499,6 +2795,7 @@ RaftConsensus::becomeLeader()
     state = State::LEADER;
     leaderId = serverId;
     printElectionState();
+    // 1. leader节点无条件永久禁止发起新选举以及接受其他节点的选举拉票（无论term值任何）
     startElectionAt = TimePoint::max();
     withholdVotesUntil = TimePoint::max();
 
@@ -2506,35 +2803,51 @@ RaftConsensus::becomeLeader()
     // log entry/snapshot. Set the clock back to when that happened, since we
     // don't really want to count that time (the cluster probably had no leader
     // for most of it).
+    // 2. 重置clusterClock的计时，排除集群未选出leader期间的计时消耗。
     clusterClock.newEpoch(clusterClock.clusterTimeAtEpoch);
 
     // The ordering is pretty important here: First set nextIndex and
     // matchIndex for ourselves and each follower, then append the no op.
     // Otherwise we'll set our localServer's last agree index too high.
+    // 3. 重置peer server的matchIndex、nextIndex等变量，以及local server的lastSyncedIndex。
     configuration->forEach(&Server::beginLeadership);
 
     // Append a new entry so that commitment is not delayed indefinitely.
     // Otherwise, if the leader never gets anything to append, it will never
     // return to read-only operations (it can't prove that its committed index
     // is up-to-date).
+    // ！！！！
+    // 4. 往log内append一条当前term的no-op的log，然后再以本地log为权威复制到多数派，该操作可以将旧term下已经存在于log中但是还未commit过的log一起commit了，
+    //    而且不需要担心commit的log丢失，如果没有这一条的话，考虑一种时序：
+    //    节点A是term 2的leader，然后他append一条log到本地之后未commit就和集群断联，然后集群选出节点B成为term 3的leader，节点B也append一条log
+    //    到本地之后未commit就和集群断联，这时候节点A正常并且发起选举并赢得了term 4的leader，这时候节点A会以自己本地log为权威复制到多数派并提交，即
+    //    之前那条term 2的log也会被commit，然后节点A再次断联，节点B正常后凭借自己本地的最新term 3 log赢得了新选举term 5的的leader，这时候节点B就会
+    //    以自己本地log为基准覆盖掉之前节点A的committed term 2 log，导致committed log丢失。
+    //    但是如果之前节点A在提交term 2 log的时候是先append了term 4 log然后再顺便一起提交term 2 log的话，节点B后来就不会赢得term 5的leader，因为他
+    //    本地的term 3 log比多数派的term 4 log要旧，那么最后选出来的term 5 leader必然是包含了节点A提交的term 4 log的，也自然包含了term 2 log，也就不会导致committed log丢失。
     Log::Entry entry;
     entry.set_term(currentTerm);
     entry.set_type(Protocol::Raft::EntryType::NOOP);
     entry.set_cluster_time(clusterClock.leaderStamp());
+    // 5. append到本地log之后，唤醒leaderDiskThreadMain进行本地持久化、唤醒peer线程进行复制到多数派，最后会推进commitIndex到currentTerm的no-op log
     append({&entry});
 
     // Outstanding RequestVote RPCs are no longer needed.
+    // 6. 可能有些peer线程还在等待之前本机candidate阶段时发出的RequestVote request的rpc response，现在已经不需要了，直接interrupt了接着执行appendEntries逻辑
     interruptAll();
 }
 
+// 用于截断本地raft log中和snapshot重复了的前缀部分，同时重新设置configuration
 void
 RaftConsensus::discardUnneededEntries()
 {
     if (log->getLogStartIndex() <= lastSnapshotIndex) {
+        // 当前的segment文件的log区间和snapshot的有重复，将重复的部分截断删除
         NOTICE("Removing log entries through %lu (inclusive) since "
                "they're no longer needed", lastSnapshotIndex);
         log->truncatePrefix(lastSnapshotIndex + 1);
         configurationManager->truncatePrefix(lastSnapshotIndex + 1);
+        // leader节点可能走到这里，所以需要调用stateChanged.notify一下。
         stateChanged.notify_all();
         if (state == State::LEADER) { // defer log sync
             logSyncQueued = true;
@@ -2558,15 +2871,21 @@ RaftConsensus::getLastLogTerm() const
     }
 }
 
+// 该方法通常在本机所认的leader发生了变化的时候调用，例如stepdown（我不当了）、startElection（我要当）、becomeLeader（我当了）、exiting（我退出了）
+// 这个函数主要有两个目的：
+//   1. 唤醒所有wait在stateChanged信号量上的peer线程，通知其起来执行任务
+//   2. 唤醒所有wait在rpc response ready信号量上的peer线程，cancel正在进行的rpc，之后去执行其他任务
 void
 RaftConsensus::interruptAll()
 {
     stateChanged.notify_all();
     // A configuration is sometimes missing for unit tests.
     if (configuration)
+        // 唤醒所有还在rpc response ready信号量上等待的peer线程，直接cancel rpc不关心此次rpc结果了。
         configuration->forEach(&Server::interrupt);
 }
 
+// 在保持request.ByteSize不大于SOFT_RPC_SIZE_LIMIT的情况下，尽可能多的将entry log加入request中。
 uint64_t
 RaftConsensus::packEntries(
         uint64_t nextIndex,
@@ -2592,6 +2911,7 @@ RaftConsensus::packEntries(
     // when the entry size drops below 200 bytes, since 1M/5K=200.
 
     using Core::Util::downCast;
+    // 限制每次request最多包含MAX_LOG_ENTRIES_PER_REQUEST个log entry
     uint64_t lastIndex = std::min(log->getLastLogIndex(),
                                   nextIndex + MAX_LOG_ENTRIES_PER_REQUEST - 1);
     google::protobuf::RepeatedPtrField<Protocol::Raft::Entry>& requestEntries =
@@ -2608,17 +2928,22 @@ RaftConsensus::packEntries(
         // and a length. We conservatively assume the tag and length will
         // be up to 10 bytes each (2^64), though in practice the tag is
         // probably one byte and the length is probably two.
+        // 由于无法单独获得一个entry在加入request序列化之后的精确byte size增量，为了避免每次都
+        // 调用request.ByteSize进行O(n)计算，这里直接进行宽松增量估算
         currentSize += uint64_t(entry.ByteSize()) + 20;
 
         if (currentSize >= SOFT_RPC_SIZE_LIMIT) {
             // The message might be too big: calculate more exact but more
             // expensive size.
+            // 估算总byte size超过了上限，调用一次O(n)操作计算精确总byte size，
+            // 并将currentSize纠正为精确值。
             uint64_t actualSize = downCast<uint64_t>(request.ByteSize());
             assert(currentSize >= actualSize);
             currentSize = actualSize;
             if (currentSize >= SOFT_RPC_SIZE_LIMIT && numEntries > 0) {
                 // This entry doesn't fit and we've already got some
                 // entries to send: discard this one and stop adding more.
+                // 纠正为精确值后的总byte size仍大于上限，在保证request内至少有一个entry log的情况下，直接抛弃最后一个entry后退出。
                 requestEntries.RemoveLast();
                 break;
             }
@@ -2631,6 +2956,11 @@ RaftConsensus::packEntries(
     return numEntries;
 }
 
+// 该方法主要是：
+//   1. 解析本机最新snapshot文件的header信息
+//   2. 对log文件进行截断以适应最新snapshot
+//   3. 对configuration进行重新设置以适应最新snapshot
+// 所以该方法并不会读取snapshot的真正数据内容，后续getNextEntry时再真正读取
 void
 RaftConsensus::readSnapshot()
 {
@@ -2639,6 +2969,7 @@ RaftConsensus::readSnapshot()
         try {
             reader.reset(new Storage::SnapshotFile::Reader(storageLayout));
         } catch (const std::runtime_error& e) { // file not found
+            // 1. 这种情况对应snapshot文件不存在
             NOTICE("%s", e.what());
         }
     }
@@ -2647,10 +2978,12 @@ RaftConsensus::readSnapshot()
         uint8_t version = 0;
         uint64_t bytesRead = reader->readRaw(&version, sizeof(version));
         if (bytesRead < 1) {
+            // 2. 这种情况对应snapshot文件存在但是size为空，直接PANIC
             PANIC("Found completely empty snapshot file (it doesn't even "
                   "have a version field)");
         } else {
             if (version != 1) {
+                // 3. 这种情况对应version不为1，当前代码无法解析snapshot格式，直接PANIC
                 PANIC("Snapshot format version read was %u, but this code can "
                       "only read version 1",
                       version);
@@ -2661,9 +2994,11 @@ RaftConsensus::readSnapshot()
         SnapshotMetadata::Header header;
         std::string error = reader->readMessage(header);
         if (!error.empty()) {
+            // 4. 这种情况对应header解析失败，基本是因为snapshot文件损坏了，直接PANIC
             PANIC("Couldn't read snapshot header: %s", error.c_str());
         }
         if (header.last_included_index() < lastSnapshotIndex) {
+            // 5. 这种情况对应当前读取的snapshot比上一次读取的覆盖范围还小，直接PANIC
             PANIC("Trying to load a snapshot that is more stale than one this "
                   "server loaded earlier. The earlier snapshot covers through "
                   "log index %lu (inclusive); this one covers through log "
@@ -2676,6 +3011,11 @@ RaftConsensus::readSnapshot()
         lastSnapshotTerm = header.last_included_term();
         lastSnapshotClusterTime = header.last_cluster_time();
         lastSnapshotBytes = reader->getSizeBytes();
+        // ！！！
+        // 一个server节点在崩溃恢复时，在与leader节点取得联系之前，本地commitIndex的确认只能通过snapshot文件来获取
+        //（注意不是本地raft log，因为存在于本地raft log并不意味着存在于多数派，只有存在于多数派的才能算作commit，而
+        // snapshot中包含的必然都是commit了的），然后后续在获取到leader的心跳之后，再基于这个commitIndex追赶Leader的commit进度，
+        // 所以本地及时打snapshot非常重要，他直接影响崩溃恢复后的commit追赶成本。
         commitIndex = std::max(lastSnapshotIndex, commitIndex);
 
         NOTICE("Reading snapshot which covers log entries 1 through %lu "
@@ -2685,7 +3025,11 @@ RaftConsensus::readSnapshot()
         // 1. Discard log if it is shorter than the snapshot.
         // 2. Discard log if its lastSnapshotIndex entry disagrees with the
         //    lastSnapshotTerm.
+        // 符合以下if条件的直接将log抛弃。
         if (log->getLastLogIndex() < lastSnapshotIndex ||
+           // 这个判断基于一个事实：如果两个日志中的两个 entry 有相同的 index 和相同的 term，那么这两个 entry 存储的是同一条命令，且它们之前的所有 entry 也完全相同。
+           // 因此如果log中的这个index的term和snapshot中的不一致，说明该index后续的log全部都坏了，而最后一个完好的log entry的index必然对应到snapshot内的某个地方，但是
+           // 已经没有必要也无法（leader无法再提供，只能提供snapshot）再找到这个精确index了，只需要直接以snapshot为基准重新记录log即可。
             (log->getLogStartIndex() <= lastSnapshotIndex &&
              log->getEntry(lastSnapshotIndex).term() != lastSnapshotTerm)) {
             // The NOTICE message can be confusing if the log is empty, so
@@ -2697,24 +3041,30 @@ RaftConsensus::readSnapshot()
             }
             // Discard the entire log, setting the log start to point to the
             // right place.
+            // 删除所有现有的segment文件，然后重新openNewSegment创建新的openSegment用于接收log写入
             log->truncatePrefix(lastSnapshotIndex + 1);
             log->truncateSuffix(lastSnapshotIndex);
+            // 重置confuguration
             configurationManager->truncatePrefix(lastSnapshotIndex + 1);
             configurationManager->truncateSuffix(lastSnapshotIndex);
             // Clean up resources.
             if (state == State::LEADER) { // defer log sync
+                // 事实上不会进入到这里，在这段代码前没有调用stateChanged.notify也能看出
                 logSyncQueued = true;
             } else { // sync log now
                 std::unique_ptr<Log::Sync> sync = log->takeSync();
                 sync->wait();
                 log->syncComplete(std::move(sync));
             }
+            // log被完全抛弃，clusterClock被重置为snapshot的time
             clusterClock.newEpoch(lastSnapshotClusterTime);
         }
 
+        // 截断本地raft log中和snapshot重复了的前缀部分，同时重新设置configuration。
         discardUnneededEntries();
 
         if (header.has_configuration_index() && header.has_configuration()) {
+            // 将snapshot中的configuration设置进ConfigurationManager，然后重新设置configuration。
             configurationManager->setSnapshot(header.configuration_index(),
                                               header.configuration());
         } else {
@@ -2723,8 +3073,13 @@ RaftConsensus::readSnapshot()
                     "found in any log).");
         }
 
+        // commitIndex可能发生了变化，这里notify主要是为了唤醒StateMachine::applyThreadMain()后台线程推进apply
         stateChanged.notify_all();
     }
+    // 有两种情况有进入以下if分支：
+    //   1. 本机snapshot已经生成过但是丢失或者损坏了，导致无法解析
+    //   2. 本机snapshot虽然存在且能够正常解析，但是由于太旧了，导致snapshot和log之间存在空隙没被覆盖。
+    // 理论上正常的snapshot在经过上面的解析之后，下面的if值应该是==，但是由于<情况下并不破坏正确性，所以只对真正致命的>做PANIC。
     if (log->getLogStartIndex() > lastSnapshotIndex + 1) {
         PANIC("The newest snapshot on this server covers up through log index "
               "%lu (inclusive), but its log starts at index %lu. This "
@@ -2735,6 +3090,7 @@ RaftConsensus::readSnapshot()
               lastSnapshotIndex, log->getLogStartIndex());
     }
 
+    // 保存snapshot reader提供给后续getNextEntry操作真正读取snapshot的内容。
     snapshotReader = std::move(reader);
 }
 
@@ -2747,23 +3103,37 @@ RaftConsensus::replicateEntry(Log::Entry& entry,
         entry.set_cluster_time(clusterClock.leaderStamp());
         append({&entry});
         uint64_t index = log->getLastLogIndex();
+        // ！！！
+        // 这里会存在一个当前write操作的log已经commit但是还是会返回Not Leader的特例：
+        // 当前正在执行集群的配置变更，leader作为新集群的临时leader把当前write操作的log连同stable state configuration log一起复制到新集群多数派，
+        // 在当前leader节点advanceCommitIndex的时候，会把当前write操作的log也一起commit，但是leader节点如果不在新配置中，leader会马上
+        // 主动stepdown(currentTerm+1)，随后当前线程醒来的时候会发现term发生变化而返回Not Leader，这在raft中是允许的，因为Not Leader
+        // 本身就意味着操作结果不确定。
         while (!exiting && currentTerm == entry.term()) {
             if (commitIndex >= index) {
                 VERBOSE("replicate succeeded");
                 return {ClientResult::SUCCESS, index};
             }
+            // 释放lock后再进入睡眠
+            // !!!
+            // 如果当前节点在集群中已经失去leader身份，他的写复制将一直拿不到多数派接受，commitIndex将无法被推进。
+            // 最后stepdownThreadMain后台线程也将由于ackEpoch拿不到多数派接受而将当前节点stepdown(currentTerm+1)，stepdown时
+            // 会执行interruptAll，该线程也会被唤醒，结果就是while循环由于term变化而退出，最后返回NOT_LEADER。
             stateChanged.wait(lockGuard);
         }
     }
     return {ClientResult::NOT_LEADER, 0};
 }
 
+// candidate节点使用该方法向每个peer节点拉票。
 void
 RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
 {
     Protocol::Raft::RequestVote::Request request;
     request.set_server_id(serverId);
+    // 1. 带上需要拉票的term，该值在此前通过startNewElection方法中单增产生。
     request.set_term(currentTerm);
+    // 2. 带上本地raft log的最后term和index，用于和peer节点比较谁的日志更新，作为对方是否投票的依据
     request.set_last_log_term(getLastLogTerm());
     request.set_last_log_index(log->getLastLogIndex());
 
@@ -2780,6 +3150,7 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
         case Peer::CallStatus::OK:
             break;
         case Peer::CallStatus::FAILED:
+            // 3. rpc failed并不会导致此次选举终止。
             peer.suppressBulkData = true;
             peer.backoffUntil = start + RPC_FAILURE_BACKOFF;
             return;
@@ -2788,6 +3159,7 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
                   "RPC or claims the request is malformed");
     }
 
+    // 4. rpc等待期间放锁，所以rpc回来之后需要检查term和state是否还是之前的值
     if (currentTerm != request.term() || state != State::CANDIDATE ||
         peer.exiting) {
         VERBOSE("ignore RPC result");
@@ -2796,28 +3168,42 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
     }
 
     if (response.term() > currentTerm) {
+        // 5. 如果对方的term比本机当前拉票的term还要大，无条件stepDown为Follower，终止本轮选举流程。
+        //    但是选举计时器不会重置，一旦新选举超时前对应term的leader没有heartbeat过来，将重新触发选举。
         NOTICE("Received RequestVote response from server %lu in "
                "term %lu (this server's term was %lu)",
                 peer.serverId, response.term(), currentTerm);
         stepDown(response.term());
     } else {
+        // 6. 本机的term确实比对方更新，对该peer的拉票结束，检查拉票是否成功
         peer.requestVoteDone = true;
         peer.lastAckEpoch = epoch;
         stateChanged.notify_all();
 
         if (response.granted()) {
+            // 7. 本机在该term下对该peer拉票成功，说明本机的log >= peer的log。
             peer.haveVote_ = true;
             NOTICE("Got vote from server %lu for term %lu",
                    peer.serverId, currentTerm);
+            // 8. 检测该term下是否获得了多数派选票，是则成为leader，否则继续等待其他选票到达或者下一轮选举被超时触发
             if (configuration->quorumAll(&Server::haveVote))
                 becomeLeader();
         } else {
+            // 9. 本机在该term下对该peer拉票失败了，说明本机的log < peer的log。
+            //    但是仍然不终止本轮选举，继续看其他选票到达情况。
             NOTICE("Vote denied by server %lu for term %lu",
                    peer.serverId, currentTerm);
         }
     }
 }
 
+// 重置本机的重新选举触发时间。
+// ！！！
+// 需要注意的是，选举等待时间并不是固定ELECTION_TIMEOUT，而是一个区间内的随机值（随机抖动机制）。
+// 由于每个follower在触发重新选举成为candidate后都是首先投自己，如果多个follower同时
+// 成为candidate，将导致split vote选举冲突，结果是没人能拿到多数派，最后所有server不得不再次等待一段时间
+// 再重新选举。而引入选举等待时间的随机抖动机制则可以错开每个follower成为candidate的时间，减少
+// 选举冲突，更快的选出新leader。
 void
 RaftConsensus::setElectionTimer()
 {
@@ -2828,6 +3214,7 @@ RaftConsensus::setElectionTimer()
     VERBOSE("Will become candidate in %s",
             Core::StringUtil::toString(duration).c_str());
     startElectionAt = Clock::now() + duration;
+    // 唤醒timerThreadMain后台线程，重置wait_until等待时间。
     stateChanged.notify_all();
 }
 
@@ -2854,18 +3241,32 @@ RaftConsensus::printElectionState() const
            votedFor);
 }
 
+// 本机触发新选举的入口方法（本机想成为新leader），有三种情况会触发：
+// 1. 现有leader超过一段时间没有发送heartbeat给本机，导致timerThreadMain后台线程被超时唤醒，触发选举。
+// 2. 本机已经处于candidate选举状态，但是超过一段时间没有集齐多数派投票无法成为leader，导致timerThreadMain后台线程被超时唤醒，触发重新选举。
+// 3. 本机崩溃重启/收到其他server的更高term，本机stepdown成Follower了，但是超过一段时间没有正确的leader找过来（headerbeat过来），
+//    一直不知道leader是谁，导致timerThreadMain后台线程被超时唤醒，触发选举。
 void
 RaftConsensus::startNewElection()
 {
     if (configuration->id == 0) {
         // Don't have a configuration: go back to sleep.
+        // 1. 本地没有集群的membership配置，不知道该向谁拉票，不申请选举
         setElectionTimer();
         return;
     }
 
+    // ！！！
+    // 注意，这里并不会约束未提交configuration，也就是说即使本机不在当前configuration内，但是只要当前的configuration未提交，
+    // 本机就应该被允许发起选举。这个主要是出于一个情况：
+    // A作为旧配置leader和新配置的临时leader（新配置不包含A），此时配置变更流程A已经将stable configuration追加到了自己本地，
+    // 但是还没将stable configuration复制到任何一台新配置节点。突然A断线重连，此时A基于新配置重新发起选举向新配置节点拉票应该是合理的，
+    // 因为A试图继续成为新配置集群的临时leader，能够继续执行未完成的配置变更流程。当然，即使A不重新成为历史leader，新旧配置集群节点
+    // 同样可以根据联合共识选出新leader。
     if (commitIndex >= configuration->id &&
         !configuration->hasVote(configuration->localServer)) {
         // we are not in the latest configuration, do not start an election
+        // 2. 本机不在已提交的集群正式membership配置中，可能是已经被移出集群了，不申请选举
         setElectionTimer();
         return;
     }
@@ -2884,21 +3285,39 @@ RaftConsensus::startNewElection()
         NOTICE("Running for election in term %lu",
                currentTerm + 1);
     }
+    // 3. 无论是否重复发起选举，每次新选举必然开新term
+    //    ！！！因此如果本机由于被集群隔离，长期处于candidate状态反复发起新选举，
+    //    ！！！那本机的term将会变得很大，这种大term不对应任何leader，但却是raft
+    //    ！！！协议下合法的。
+    // JOEY_TODO: 做Pre-Vote
     ++currentTerm;
+    // 4. 处于candidate拉票状态
     state = State::CANDIDATE;
+    // 5. 在已开的新term中还不知道leader是谁
     leaderId = 0;
+    // 6. 新开的term首先投给自己
     votedFor = serverId;
     printElectionState();
+    // 7. 重置选举计时器，如果此次选举后续没有获取多数派选票无法成为leader，超时后会再次触发新选举
     setElectionTimer();
+    // 8. 重置peer给本机的投票信息，之前的拉票信息全部作废
     configuration->forEach(&Server::beginRequestVote);
+    // 9. 已经不认之前的leader了，抛弃正在从leader接收的snapshot，删除正在写的partial snaposhot
     if (snapshotWriter) {
         snapshotWriter->discard();
         snapshotWriter.reset();
     }
+    // 10. 在peer真正发送requestVote请求前，必须将新开的term以及votefor信息持久化。避免出现其他peer已经给我选票但是metadata没持久化时崩溃，
+    //     自己崩溃恢复后丢失了选举信息。
     updateLogMetadata();
+    // 11. 这个操作会唤醒所有peer线程就位（等RaftConsensus mutex）等待发送requestVote，正在进行的rpc会被cancel，包括上一次触发选举时还在等待的requestVote请求。
     interruptAll();
 
     // if we're the only server, this election is already done
+    // 12. 两种情况：
+    //  1) 如果配置中有其他peer存在，所有这些peer的haveVote必然为false，因为刚刚beginRequestVote时重置了所有peer的投票信息，
+    //     而当前线程一直持有RaftConsensus mutex，peer线程必不可能发送得了requestVote，因此haveVote截至此时必然false。
+    //  2) 如果目前已知是单节点集群，quorumAll自动满足，本机直接成为leader即可。
     if (configuration->quorumAll(&Server::haveVote))
         becomeLeader();
 }
@@ -2954,6 +3373,9 @@ RaftConsensus::stepDown(uint64_t newTerm)
 void
 RaftConsensus::updateLogMetadata()
 {
+    // ！！！
+    // metadata需要对term和votefor持久化，是为了标记当前term下本机投票给了谁，
+    // 主要是防止在本机崩溃恢复后重复投票。
     log->metadata.set_current_term(currentTerm);
     log->metadata.set_voted_for(votedFor);
     VERBOSE("updateMetadata start");
@@ -2961,15 +3383,35 @@ RaftConsensus::updateLogMetadata()
     VERBOSE("updateMetadata end");
 }
 
+// ！！！
+// 该方法是Server端应对Client端statemachine read-only请求的ReadIndex机制的核心实现方法，
+// 在Leader节点接收到client端的read-only请求时，Leader节点需要先通过该方法开新epoch
+// 然后检测ackEpoch（由心跳成功回复后更新，机制上和stepDownThreadMain一样），以确保自己的Leader身份还被多数派认可。（该方法不负责发心跳）
+// JOEY_TODO: 可以实现lease租约，从而加速read-only请求。
 bool
 RaftConsensus::upToDateLeader(std::unique_lock<Mutex>& lockGuard) const
 {
+    // !!!
+    // read-only请求由于不涉及raft log的append，所以leader在进行quorum多数派检查时没办法像read-write操作一样检查peer server的matchIndex。
+    // 在ReadIndex机制下，通过currentEpoch这个值实现这个检查功能。
+    // read-only请求在schedule hearbeat前，先++currentEpoch开一个新的epoch，随后发送的peer rpc
+    // (包括appendEntries、installSnapshot、requestVote所有这些会与peer进行request-response沟通的rpc)如果获得了follower的认可leader
+    // acknowledge response，就会更新peer的laskAckEpoch为该epoch值，表示在该epoch内，该peer认可当前leader。
+    // 这里其实涉及一个时序问题：
+    // timeLine :---------------------------------------------------------------------------------------------------------------------------------------->
+    // Leader   ： read start    epoch+1    send heartbeat     quorum ok                                                                       read end
+    // Followers:                                                          start vote    new leader write start        new leader write end
+    // 这时候旧leader的read没有包括新leader的write，但是由于旧leader的read是开始于新leader的write之前的，
+    // 所以事实上read的线性化点可以是read start时刻，这种情况下read不包括新leader write就还是符合线性强一致的，
+    // 比如单机对atomic进行load和fetch_add操作，即使两者同时进行，操作系统也会给他们有一个顺序，这种情况下read包括不包括write都是合理的。
     ++currentEpoch;
     uint64_t epoch = currentEpoch;
     // schedule a heartbeat now so that this returns quickly
+    // 不同于stepDownThreadMain的周期性检测，本方法出于及时回应client请求的考虑，会提前触发心跳。
     configuration->forEach(&Server::scheduleHeartbeat);
     stateChanged.notify_all();
     while (true) {
+        // 这里不需要再检查term是否和之前开epoch时的term一致，我们关心的是：当前节点认定自己是leader的前提下，当前节点是否真的含有足够新的数据提供给read。
         if (exiting || state != State::LEADER)
             return false;
         if (configuration->quorumMin(&Server::getLastAckEpoch) >= epoch) {
@@ -2978,6 +3420,11 @@ RaftConsensus::upToDateLeader(std::unique_lock<Mutex>& lockGuard) const
             // the entry's term at commitIndex matches our currentTerm, but
             // snapshots mean that we may not have the entry in our log. Since
             // commitIndex >= lastSnapshotIndex, we split into two cases:
+            // 这里其实甚至都不需要此刻当前节点就是集群真正的leader，我们只需要保证多数派的quorum ok是发生在read start之后，就可以确定在read start的后续某个时刻，
+            // 当前节点确实被多数派认定为了leader，即使在那次quorum ok之后当前节点又丢失了leader身份，也无所谓，只要我们能够确保当前节点在此时的commitTerm已经达到了
+            // 此前那次quorum ok时的leader term就OK了，就可以确保当前节点的log必然是包括了read start之前的所有已提交write。
+            // 由于此前quorum ok时精确时刻的leader term无法获取，但是鉴于term是集群全局单增的，所以直接保守判断当前的commitTerm==currentTerm，由于currentTerm必然>=此前
+            // quorum ok时的leader term，只要commitTerm==currentTerm，就可以。
             uint64_t commitTerm;
             if (commitIndex == lastSnapshotIndex) {
                 commitTerm = lastSnapshotTerm;

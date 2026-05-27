@@ -63,6 +63,10 @@ ThreadDispatchService::~ThreadDispatchService()
     }
 }
 
+// epoll主线程在读取到某service的socket事件之后，最终会调用到这个handleRPC，随即返回继续epoll_wait，并不会实际执行rpc任务，这里会做三件事：
+//   1. 将socket过来的rpc任务抛到rpcQueue中，提供给worker线程消费
+//   1. 如果service的worker线程不足，就会创建新thread
+//   2. 唤醒一个worker线程执行任务
 void
 ThreadDispatchService::handleRPC(ServerRPC serverRPC)
 {
@@ -101,6 +105,7 @@ ThreadDispatchService::workerMain()
             rpcQueue.pop();
         }
         // execute RPC handler
+        // 这个threadSafeService才是ClientService、RaftService和ControlService的本体，由一个worker线程实际执行rpc任务。
         threadSafeService->handleRPC(std::move(rpc));
     }
 }

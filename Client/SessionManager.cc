@@ -38,6 +38,7 @@ SessionManager::createSession(const RPC::Address& address,
                               ClusterUUID* clusterUUID,
                               ServerId* serverId)
 {
+    // 1. 成功TCP connect对应的server节点
     std::shared_ptr<RPC::ClientSession> session =
         RPC::ClientSession::makeSession(
                         eventLoop,
@@ -48,6 +49,7 @@ SessionManager::createSession(const RPC::Address& address,
     if (!session->getErrorMessage().empty() || skipVerify)
         return session;
 
+    // 2. 给连接上的server节点发送verify request，确保对方的实际clusterUUID:serverId就是自己想连接的那个
     Protocol::Client::VerifyRecipient::Request request;
     if (clusterUUID != NULL) {
         std::string uuid = clusterUUID->getOrDefault();

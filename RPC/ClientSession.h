@@ -325,6 +325,7 @@ class ClientSession {
      * This is used to determine when to schedule the timer: the timer is
      * scheduled if numActiveRPCs is non-zero.
      */
+    // 已发送的但未接收response的非RPC ping心跳请求，主要用于控制RPC ping心跳机制：非0时启动RPC ping心跳，归0时取消RPC ping心跳。
     uint32_t numActiveRPCs;
 
     /**

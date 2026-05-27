@@ -75,6 +75,9 @@ Server::bind(const Address& listenAddress)
     return opaqueServer.bind(listenAddress);
 }
 
+// 这里传进来的service入参就是ClientService、RaftService和ControlService
+// 但是这种register的时候会把这个service封装进一个ThreadDispatchService中，
+// 其中会负责生成和分发worker线程再执行实际的service。
 void
 Server::registerService(uint16_t serviceId,
                         std::shared_ptr<Service> service,

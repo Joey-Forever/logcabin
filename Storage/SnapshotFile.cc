@@ -139,6 +139,10 @@ template<typename T>
 Writer::SharedMMap<T>::SharedMMap()
     : value(NULL)
 {
+    // ！！！
+    // 通过mmap在内核态直接申请一块共享内存空间，从而避免fork机制的COW，这样后续
+    // 在子进程不断写入snapshot的时候，可以同步更新该变量，父进程可以直接读取该变量
+    // 获取子进程的更新值。
     void* addr = mmap(NULL,
                       sizeof(*value),
                       PROT_READ|PROT_WRITE,
@@ -212,6 +216,7 @@ Writer::save()
 {
     if (file.fd < 0)
         PANIC("File already closed");
+    // 需要先保证file sync成功之后再rename 目录项，否则rename成功但file sync之前崩溃的话，就会出问题
     FilesystemUtil::fsync(file);
     uint64_t fileSize = FilesystemUtil::getSize(file);
     file.close();
@@ -256,6 +261,7 @@ Writer::writeRaw(const void* data, uint64_t length)
               strerror(errno));
     }
     bytesWritten += Core::Util::downCast<uint64_t>(r);
+    // 更新位于内核态mmap共享内存的变量，以供其他进程读取
     *sharedBytesWritten.value += Core::Util::downCast<uint64_t>(r);
 }
 

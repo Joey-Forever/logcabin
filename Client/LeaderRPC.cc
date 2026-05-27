@@ -116,6 +116,8 @@ LeaderRPC::Call::wait(google::protobuf::Message& response,
         case RPCStatus::SERVICE_SPECIFIC_ERROR:
             switch (error.error_code()) {
                 case Protocol::Client::Error::NOT_LEADER:
+                    // 当请求的server不是Leader时就会返回到这里，这时候leaderSession会被reset，然后
+                    // 如果旧server返回hint告诉client谁可能是leader，下次RETRY生成leaderSession时会去连接指定server，否则随机选。
                     // The server we tried is not the current cluster leader.
                     if (error.has_leader_hint()) {
                         leaderRPC.reportRedirect(cachedSession,
@@ -136,6 +138,8 @@ LeaderRPC::Call::wait(google::protobuf::Message& response,
             }
             break;
         case RPCStatus::RPC_FAILED:
+            // 当RPC层的ping心跳超时时会返回到这里，reportFailure内会把leaderSession reset析构，
+            // 然后下次RETRY时直接新建一个leaderSession（随机选一个server连接），RPC ping状态也会随之被重置。
             leaderRPC.reportFailure(cachedSession);
             break;
         case RPCStatus::RPC_CANCELED:
@@ -192,8 +196,11 @@ LeaderRPC::call(OpCode opCode,
             case Call::Status::OK:
                 return Status::OK;
             case Call::Status::TIMEOUT:
+            // call操作的全局耗时超过上层client传递下来的timeout值时会触发这里的return TIMEOUT，之后上层client再重试的话会基于一个不同的rpc_number了，所以如果上层直接
+            // 重试会可能导致server重复写，所以上层client接收到这个TIMEOUT后必须保证幂等再重试。
                 return Status::TIMEOUT;
             case Call::Status::RETRY:
+            // rpc层的心跳ping失败时候会触发这里的retry，这里的retry会基于同一个{client_id, rpc_number}进行，所以不会导致server重复写（状态机中sessions表保证）
                 break;
             case Call::Status::INVALID_REQUEST:
                 return Status::INVALID_REQUEST;
@@ -207,6 +214,10 @@ LeaderRPC::makeCall()
     return std::unique_ptr<LeaderRPCBase::Call>(new LeaderRPC::Call(*this));
 }
 
+// 获取一个leaderSession，这个leaderSession实例是和唯一一个server节点建立connect连接关系的，
+// 也就意味着只要client和某一个server断连了或者需要主动换server连接，都需要reset leaderSession并重新生成。
+// ！需要注意的是，重新生成leaderSession并不会导致当前client在server集群raft log中的ExactOnce信息发生变化，
+//   因为这个信息是存储在raft log的，是集群共享的，client换server连接但还是在同一个raft集群。
 std::shared_ptr<RPC::ClientSession>
 LeaderRPC::getSession(TimePoint timeout)
 {
@@ -229,6 +240,10 @@ LeaderRPC::getSession(TimePoint timeout)
 
     if (leaderSession)
         return leaderSession;
+    
+    // leaderSession不存在了，重新生成一个并且connect一个server节点，
+    // 如果上一个server没有给hint，就从client所有已知servers中随机选一个，如果有hint，
+    // 就从hint中随机选一个。
 
     // This thread will create a new session; others should wait.
     isConnecting = true;
@@ -261,8 +276,10 @@ LeaderRPC::getSession(TimePoint timeout)
                     "Failed to create session to leader: timeout expired");
             usedHint = false;
         } else {
+            // 1、从servers列表中选一个server
             address.refresh(timeout);
             VERBOSE("Connecting to: %s", address.toString().c_str());
+            // 2、生成一个ClientSession并connect上指定server
             session = sessionManager.createSession(
                     address,
                     timeout,
