@@ -148,12 +148,18 @@ ClientService::setConfiguration(RPC::ServerRPC rpc)
     rpc.reply(response);
 }
 
+// client 的read-write类状态机命令会 RPC 到这个方法中；follower 也可能收到，
+// 但只有 leader 会真正复制日志，非 leader 会返回 NOT_LEADER。
+// read-write state machine command：包括 open session、close session、tree mkdir/write/remove、advance version。这类操作会修改复制状态机状态，必须走 Raft
 void
 ClientService::stateMachineCommand(RPC::ServerRPC rpc)
 {
+    // 1. 解析出业务请求
     PRELUDE(StateMachineCommand);
     Core::Buffer cmdBuffer;
     rpc.getRequest(cmdBuffer);
+    // 2. 如果当前节点是 leader，将请求复制到本地raft log以及远端多数派；
+    // 非 leader 会在这里返回 NOT_LEADER。
     std::pair<Result, uint64_t> result = globals.raft->replicate(cmdBuffer);
     if (result.first == Result::RETRY || result.first == Result::NOT_LEADER) {
         Protocol::Client::Error error;
@@ -166,6 +172,7 @@ ClientService::stateMachineCommand(RPC::ServerRPC rpc)
     }
     assert(result.first == Result::SUCCESS);
     uint64_t logIndex = result.second;
+    // 3. 等待对应业务操作的raft log最终被apply到state machine后构造rpc response
     if (!globals.stateMachine->waitForResponse(logIndex, request, response)) {
         rpc.rejectInvalidRequest();
         return;
@@ -173,6 +180,7 @@ ClientService::stateMachineCommand(RPC::ServerRPC rpc)
     rpc.reply(response);
 }
 
+// read-only state machine query：包括读文件、读目录等这类client的所有只读查询。只需要先等本节点状态机 apply 到 leader 当前 commit index，然后直接查本地状态机，不需要走raft。
 void
 ClientService::stateMachineQuery(RPC::ServerRPC rpc)
 {

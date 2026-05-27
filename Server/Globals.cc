@@ -100,6 +100,9 @@ Globals::~Globals()
     serverStats.exit();
 }
 
+// 1. 完成三个rpc服务的注册，占用指定的socket监听端口
+// 2. init RaftConsensus对象
+// 3. 创建 stateMachine对象
 void
 Globals::init()
 {

@@ -175,6 +175,8 @@ StateMachine::waitForResponse(uint64_t logIndex,
                               Command::Response& response) const
 {
     std::unique_lock<Core::Mutex> lockGuard(mutex);
+    // read-write类状态机命令rpc service 最后会在这里等待对应的 Raft log 最终被apply到state machine，
+    // 然后再构造出response回复给client。
     while (lastApplied < logIndex)
         entriesApplied.wait(lockGuard);
 
@@ -297,6 +299,11 @@ StateMachine::setInhibit(std::chrono::nanoseconds duration)
 
 ////////// StateMachine private methods //////////
 
+// client在请求的时候raft log中会给他开一个session，并且对于每次该session的请求entry都会在raft log中记录exactly_once，用于标记唯一的{client_id, rpc_number},
+// 但是raft log本身不会对这个pair进行去重，也就是raft log是可能存在重复的{client_id，rpc_number}的，但是raft log只需要顺序apply即可，state machine中会维护
+// 真正的内存sessions表，在state machine执行apply的时候会对照内存sessions表再执行去重，避免state machine的重复apply。也就意味着，在每次生成snapshot对state machine
+// 进行持久化的时候，内存sessions表也需要被持久化。
+// ！！这里的 exactly-once 不是“exactly-once appended to log”，而是“exactly-once applied to state machine”。
 void
 StateMachine::apply(const RaftConsensus::Entry& entry)
 {
@@ -405,6 +412,8 @@ StateMachine::applyThreadMain()
             }
             expireSessions(entry.clusterTime);
             lastApplied = entry.index;
+            // 有新的raft log被apply到了state machine，lastApplied已经被更新，
+            // 唤醒所有在waitForResponse中wait entriesApplied的rpc service.
             entriesApplied.notify_all();
             if (shouldTakeSnapshot(lastApplied) &&
                 maySnapshotAt <= Clock::now()) {

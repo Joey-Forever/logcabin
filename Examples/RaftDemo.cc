@@ -53,6 +53,7 @@ std::string joinPath(const std::string& a, const std::string& b);
 void mkdirIfNeeded(const std::string& path);
 
 const char* SERVER_BINARY = "build/LogCabin";
+const char* STORAGE_TOOL_BINARY = "build/Storage/Tool";
 const char* WORKDIR = "raftdemo";
 const char* LOG_POLICY = "NOTICE";
 const char* CLIENT_PATH = "/demo/message";
@@ -265,6 +266,26 @@ checkServers(const std::vector<Process>& processes)
     }
 }
 
+void
+dumpReadableRaftLogs(const std::vector<std::string>& configs)
+{
+    if (access(STORAGE_TOOL_BINARY, X_OK) != 0) {
+        std::cout << "Skipping readable raft log dumps: missing executable "
+                  << STORAGE_TOOL_BINARY << std::endl;
+        return;
+    }
+    for (size_t i = 0; i < configs.size(); ++i) {
+        std::string dumpPath = joinPath(WORKDIR,
+                                        "server" + std::to_string(i + 1) +
+                                        ".raftlog.txt");
+        pid_t pid = spawn({STORAGE_TOOL_BINARY, "--config", configs[i]},
+                          dumpPath);
+        waitSuccess(pid, "raft log dump for server " +
+                         std::to_string(i + 1));
+        std::cout << "Wrote readable raft log dump " << dumpPath << std::endl;
+    }
+}
+
 // Demo 启动阶段需要做一次固定 membership 初始化：
 // --bootstrap 只让 server 1 具备初始配置，server 2/3 启动后还不是
 // voting member。这里通过 client API 把集群 membership 固定设置为
@@ -397,6 +418,7 @@ runLauncher()
         std::cout << "Client completed" << std::endl;
 
         terminate(servers);
+        dumpReadableRaftLogs(configs);
         return 0;
     } catch (...) {
         terminate(servers);

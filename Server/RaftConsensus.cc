@@ -2181,6 +2181,9 @@ RaftConsensus::advanceCommitIndex()
     }
 
     // calculate the largest entry ID stored on a quorum of servers
+    // 所有raft节点共同参与多数派验证：
+    // --对于leader节点来说，getMatchIndex() 返回 lastSyncedIndex，也即是本地log sync成功。
+    // --对于远端peer follower节点来说，getMatchIndex() 返回 matchIndex，也即是AppendEntries返回成功。
     uint64_t newCommitIndex =
         configuration->quorumMin(&Server::getMatchIndex);
     if (commitIndex >= newCommitIndex)
@@ -2195,6 +2198,8 @@ RaftConsensus::advanceCommitIndex()
     commitIndex = newCommitIndex;
     VERBOSE("New commitIndex: %lu", commitIndex);
     assert(commitIndex <= log->getLastLogIndex());
+    // commit Index成功推进了，这里主要是为了唤醒state machine的applyThreadMain后台线程，让他执行apply操作；
+    // 其次是唤醒rpc service线程，让他进入waitForResponse。
     stateChanged.notify_all();
 
     if (state == State::LEADER && commitIndex >= configuration->id) {
@@ -2242,6 +2247,12 @@ RaftConsensus::append(const std::vector<const Log::Entry*>& entries)
             configurationManager->add(index, entry.configuration());
         ++index;
     }
+    // 对于leader节点来说，log被append到本地（但是没sync）之后，会设置logSyncQueued = true以及更新LastLogIndex，
+    // 然后notify_all会唤醒leaderDiskThread以及各个peer thread。
+    // leaderDiskThreadMain 看到 logSyncQueued == true，就把 leader 本地尚未 sync 的 log 刷到稳定存储。
+    // peerThread 看到 peer.matchIndex < log->getLastLogIndex()，就给对应 follower 发 AppendEntries。
+    // ！！所以leader本地sync和复制到多数派实际上是并行进行的。
+    // 需要注意的是，这里其实state machine的applyThreadMain这个后台线程也会也唤醒，只是在commitIndex被成功推进之前，他不会执行apply而是会继续睡眠。
     stateChanged.notify_all();
 }
 
@@ -2752,6 +2763,7 @@ RaftConsensus::replicateEntry(Log::Entry& entry,
                 VERBOSE("replicate succeeded");
                 return {ClientResult::SUCCESS, index};
             }
+            // 释放lock后再进入睡眠
             stateChanged.wait(lockGuard);
         }
     }
