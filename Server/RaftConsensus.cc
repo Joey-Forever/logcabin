@@ -93,6 +93,8 @@ LocalServer::beginRequestVote()
 void
 LocalServer::beginLeadership()
 {
+    // raft保证Follower节点的所有append log在对外可知的情况下都已经是持久化了的，所以当一个Follower节点从Candidate成功成为Leader时，可以直接
+    // 设置本机的lastSyncedIndex为last log index。
     lastSyncedIndex = consensus.log->getLastLogIndex();
 }
 
@@ -1121,10 +1123,14 @@ RaftConsensus::init()
     Storage::SnapshotFile::discardPartialSnapshots(storageLayout);
 
     if (configuration->id == 0)
+        // 7. 本机经过恢复raft log和snapshot步骤之后，连configuration都没有，说明本机
+        //    可能是个新加入集群的空server节点，需要等待leader节点后续走配置变更流程复制过来。
         NOTICE("No configuration, waiting to receive one.");
 
-    // JOEY_TODO: 看到这里
+    // 8. 节点重启后，无条件stepDown为metadata中记录的currentTerm，转为Follower，选举超时也会在这里重置，
+    //    保证后续如果收不到leader心跳可以主动发起选举。
     stepDown(currentTerm);
+    // JOEY_TODO: 看到这里
     if (RaftConsensusInternal::startThreads) {
         leaderDiskThread = std::thread(
             &RaftConsensus::leaderDiskThreadMain, this);
@@ -1351,6 +1357,9 @@ RaftConsensus::handleAppendEntries(
     // our term and convert to follower if necessary; reset the
     // election timer. set it here in case request we exit the
     // function early, we will set it again after the disk write.
+    // 值得注意的是，这里只要对方的term不小于currentTerm，本机就无条件承认对方的leader身份，即使对方可能在事实上已经没有了leader身份。
+    // 但是即使如此，这个假leader也只能暂时污染少数派节点，如果多数派已经选出新leader，假leader的任何操作都得不到quorum，最终自己主动退位，
+    // 而那些被污染的少数派节点也会在与新leader取得联系时被纠正。
     stepDown(request.term());
     setElectionTimer();
     withholdVotesUntil = Clock::now() + ELECTION_TIMEOUT;
@@ -3322,17 +3331,29 @@ RaftConsensus::startNewElection()
         becomeLeader();
 }
 
+// 该方法用于节点将本机状态转换成Follower状态，主要有五种情况：
+//  1）节点刚启动进行RaftConsensus::init时，需要调用stepDown(currentTerm)加入Follower状态，后续才能发起新选举
+//  2）任意状态节点从leader节点request处获得不小于currentTerm的term，无论该leader还是不是事实上的leader
+//  3）follower/candidate节点从candidate节点request处获得比currentTerm更高的term
+//  4）leader节点从其他server节点response处获得比currentTerm更高的newTerm，无论该newTerm是否对应一个合法leader，都调用stepdown(newTerm)
+//  5）leader节点定时心跳quorum失败/leader节点发现新的committed stable configuration不再包含本机，也调用stepdown(currentTerm+1)
 void
 RaftConsensus::stepDown(uint64_t newTerm)
 {
+    // 1. 只有当newTerm不小于currentTerm时才允许执行stepDown
     assert(currentTerm <= newTerm);
     if (currentTerm < newTerm) {
+        // 2. newTerm比currentTerm要大，currentTerm变更为更大的newTerm
         VERBOSE("stepDown(%lu)", newTerm);
         currentTerm = newTerm;
+        // 3. 由于在更大的newTerm下，本机还不知道leader是谁（甚至可能还没有leader），也没有在newTerm下投过票，所以需要重置leaderId和votedFor
         leaderId = 0;
         votedFor = 0;
+        // 4. term和votedFor发生变化时必须马上同步持久化metadata
         updateLogMetadata();
+        // 5. 如果leader节点有正在进行的staging configuration变更状态，直接放弃
         configuration->resetStagingServers();
+        // 6. 如果follower节点有正在进行的snaoshit接收任务，直接放弃
         if (snapshotWriter) {
             snapshotWriter->discard();
             snapshotWriter.reset();
@@ -3340,21 +3361,29 @@ RaftConsensus::stepDown(uint64_t newTerm)
         state = State::FOLLOWER;
         printElectionState();
     } else {
+        // 7. newTerm和currentTerm是一样的，而leader节点不会stepDown和currentTerm相同的term，所以对于follower/candidate节点，
+        //    原来的term下所记录的leaderId、votedFor、正在接收的snaoshot流程都不应该发生变化。
         if (state != State::FOLLOWER) {
             state = State::FOLLOWER;
             printElectionState();
         }
     }
+    // 8. 本机切换至Follower状态后，需要保证选举计时器能够正常工作，且能够正常接收其他server的拉票
     if (startElectionAt == TimePoint::max()) // was leader
         setElectionTimer();
     if (withholdVotesUntil == TimePoint::max()) // was leader
         withholdVotesUntil = TimePoint::min();
+    // 9. 本机状态已经发生变化，原来的rpc任务已经没有意义，cancel所有进行中的rpc request流程，唤醒所有peer线程重新进入新的Follower状态执行逻辑
     interruptAll();
 
+    // ！！！
+    // 10. 还有一个很关键的点，就是raft需要保证Follower节点本地所有的append log都是已经fsync持久化了的。否则一旦后续该节点再次发起选举，可能会基于一个未持久化的log
+    //     去竞争选票。因此在leader stepDown为follower节点时，还需要同时将所有已经append log进行持久化。
     // If the leader disk thread is currently writing to disk, wait for it to
     // finish. We poll here because we don't want to release the lock (this
     // server would then believe its writes have been flushed when they
     // haven't).
+    //     1）首先轮询等待正在执行fsync任务的leaderDiskThreadMain线程把任务完成，因为我们不能在stepDown操作完整执行完之前释放mutex，所以这里只能持锁轮询等待。
     while (leaderDiskThreadWorking)
         usleep(500);
 
@@ -3362,6 +3391,8 @@ RaftConsensus::stepDown(uint64_t newTerm)
     // for leaderDiskThread to preserve FIFO ordering of Log::Sync objects.
     // Don't bother updating the localServer's lastSyncedIndex, since it
     // doesn't matter for non-leaders.
+    //     2）如果leader此前刚刚append log之后马上就stepDown了，leaderDoskThreadMain没来得及取该sync进行操作，这里需要立即同步将其执行。在leaderDiskThreadMain
+    //        执行完后我们再取sync执行，是为了维护文件操作的FIFO语义，先产生的文件操作必须先执行。
     if (logSyncQueued) {
         std::unique_ptr<Log::Sync> sync = log->takeSync();
         sync->wait();
