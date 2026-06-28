@@ -176,6 +176,7 @@ Globals::init()
                    address.toString().c_str());
         }
         raft->serverAddresses = listenAddressesStr;
+        // JOEY_TODO: 看到这里
         raft->init();
     }
 

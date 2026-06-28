@@ -1130,12 +1130,15 @@ RaftConsensus::init()
     // 8. 节点重启后，无条件stepDown为metadata中记录的currentTerm，转为Follower，选举超时也会在这里重置，
     //    保证后续如果收不到leader心跳可以主动发起选举。
     stepDown(currentTerm);
-    // JOEY_TODO: 看到这里
+    // 9. 创建并启动一些必须的后台线程
     if (RaftConsensusInternal::startThreads) {
+        // 1）用于Leader节点异步执行文件操作
         leaderDiskThread = std::thread(
             &RaftConsensus::leaderDiskThreadMain, this);
+        // 2）用于Follower/Candidate节点超时发起新选举
         timerThread = std::thread(
             &RaftConsensus::timerThreadMain, this);
+        // 3) 用于Leader节点定时检查集群所有节点共同支持的最新state machine版本然后对runningVersion进行升级
         if (globals.config.read<bool>("disableStateMachineUpdates", false)) {
             NOTICE("Not starting state machine updater thread (state machine "
                    "updates are disabled in config)");
@@ -1143,10 +1146,12 @@ RaftConsensus::init()
             stateMachineUpdaterThread = std::thread(
                 &RaftConsensus::stateMachineUpdaterThreadMain, this);
         }
+        // 4）用于Leader节点在向多数派心跳quorum得不到ok时主动stepDown
         stepDownThread = std::thread(
             &RaftConsensus::stepDownThreadMain, this);
     }
     // log->path = ""; // hack to disable disk
+    // 10. RaftConsensus实例初始化结束了，唤醒一下等待stateChanged的线程
     stateChanged.notify_all();
     printElectionState();
 }
@@ -2120,6 +2125,9 @@ operator<<(std::ostream& os, const RaftConsensus& raft)
 //// RaftConsensus private methods that MUST acquire the lock
 //// 以下private方法都是某一个后台线程的执行函数，会和从public方法进来的外界线程互斥访问成员变量，所以必须加锁。
 
+// 每个server节点运行代码版本的state machine都支持一套自己的commands，不同版本的state machine可以识别执行的apply命令不同，
+// 如果节点强行apply某条自身不支持的命令，会导致崩溃。
+// 该方法对应的后台线程就是用于leader节点定时更新升级集群的state machine版本，保证集群的state machine版本升级到最新的其中的apply命令能够被所有节点的代码识别的版本。
 void
 RaftConsensus::stateMachineUpdaterThreadMain()
 {
@@ -2130,16 +2138,32 @@ RaftConsensus::stateMachineUpdaterThreadMain()
     // server stat gets to be large, this may need to be revisited.
     std::unique_lock<Mutex> lockGuard(mutex);
     Core::ThreadId::setName("StateMachineUpdater");
+    // 1. lastVersionCommitted是线程局部变量，且不会持久化，所以leader重启后可能会往raft log中append一个<=上一个已commit version的版本，
+    //    因此这个变量并不是一个安全状态，只是一个本地优化。真正的安全保证在statemachine执行apply的时候：
+    //       1）节点的statemachine runningVersion如果已经是新版本，在apply到一个更旧的version时会直接拒绝，也就是state machine running version是单增的，不会降级。
+    //       2）节点的代码版本如果比较旧，那么他在apply到前面的更新version时会直接PANIC
     uint64_t lastVersionCommitted = 0;
     TimePoint backoffUntil = TimePoint::min();
     while (!exiting) {
         TimePoint now = Clock::now();
+        // 2. 本质上还是往raft log中append一条state machine升级的log，所以也是只能在leader节点中执行
         if (backoffUntil <= now && state == State::LEADER) {
             using RaftConsensusInternal::StateMachineVersionIntersection;
             StateMachineVersionIntersection s;
+            // 3. 统计本机已知的所有server节点支持的state machine版本区间（对方server节点支持的区间由其handleAppendEntries时一起
+            //    response回本机leader）交集（minVersion是所有区间min的最大值，maxVersion是所有区间max的最小值）。
+            //    ！！！
+            //    注意，这里是统计knownServers的所有节点，包括staging servers。避免某个state machine代码版本比较旧的节点突然网络分区
+            //    和集群断联时集群偷偷升级版本，导致该节点重连集群时出问题。只有当一个节点被stable移出集群了，knownServers发生改变后，后续计算出的
+            //    升级版本号才不会考虑该节点。这也就意味着，如果一个被移出集群的server节点如果后续要重新加入集群，新运行的state machine代码版本必须至少不比当前集群已提交的最大state machine runningVersion旧，否则
+            //    在apply日志的时候一旦apply到不支持的新版本号，就会PANIC。如果是在配置变更成功之后，新节点才apply到不支持的新版本号，严重时可能导致整个集群多数派全部崩溃导致集群不可用。
+            // JOEY_TODO: leader本机在配置变更时，在进入staging state前后，必须分别执行一次configuration for each StateMachineVersionIntersection计算，如果进入staging state后
+            //            找不到交集或者交集的maxVersion变小，说明新配置节点state machine代码存在版本问题/版本过旧，应该拒绝变更配置。
             configuration->forEach(std::ref(s));
             if (s.missingCount == 0) {
+                // 4. 所有已知server都有对应的version区间了
                 if (s.minVersion > s.maxVersion) {
+                    // 5. 没有找到一个所有server都重叠的有效交集，设置backoffUntil sleep时间后续再尝试
                     ERROR("The state machines on the %lu servers do not "
                           "currently support a common version "
                           "(max of mins=%u, min of maxes=%u). Will wait to "
@@ -2150,13 +2174,16 @@ RaftConsensus::stateMachineUpdaterThreadMain()
                           s.maxVersion);
                     backoffUntil = now + STATE_MACHINE_UPDATER_BACKOFF;
                 } else { // s.maxVersion is the one we want
+                    // 6. 找到了所有已知server节点的区间的重叠有效交集，取交集的maxVersion作为本次升级的版本
                     if (s.maxVersion > lastVersionCommitted) {
+                        // 7. maxVersion大于上次commit的升级版本，可以执行升级
                         NOTICE("Appending log entry to advance state machine "
                                "version to %u (it may be set to %u already, "
                                "but it's hard to check that and not much "
                                "overhead to just do it again)",
                                s.maxVersion,
                                s.maxVersion);
+                        // 8. 先构造一条DATA类型的entry log，data内容是此次升级的version版本号
                         Log::Entry entry;
                         entry.set_term(currentTerm);
                         entry.set_type(Protocol::Raft::EntryType::DATA);
@@ -2168,11 +2195,16 @@ RaftConsensus::stateMachineUpdaterThreadMain()
                         Core::ProtoBuf::serialize(command, cmdBuf);
                         entry.set_data(cmdBuf.getData(), cmdBuf.getLength());
 
+                        // 9，跟一般的state machine command和setConfiguration command一样，走replicateEntry
+                        //    append到本地log后复制到quorum多数派和本地fsync，等待成功commit返回或者返回NOT_LEADER。
                         std::pair<ClientResult, uint64_t> result =
                             replicateEntry(entry, lockGuard);
                         if (result.first == ClientResult::SUCCESS) {
+                            // 10. 成功commit了，更新一下lastVersionCommitted
                             lastVersionCommitted = s.maxVersion;
                         } else {
+                            // 11. 复制多数派quorum失败了，可能是失去了leader，总之version升级没成功，
+                            //     设置backoffUntil sleep时间后续重试
                             using Core::StringUtil::toString;
                             WARNING("Failed to commit entry to advance state "
                                     "machine version to version %u (%s). "
@@ -2184,9 +2216,12 @@ RaftConsensus::stateMachineUpdaterThreadMain()
                         continue;
                     } else {
                         // We're in good shape, go back to sleep.
+                        // 12. maxVersion不大于上次commit的升级版本，忽略此次升级，继续sleep
                     }
                 }
             } else { // missing info from at least one server
+                // 13. 本机已知的servers中有的server还没有回复过其支持的版本区间，信息不全，放弃本次升级，
+                //     设置backoffUntil避免频繁重试失败。
                 // Do nothing until we have info from everyone else
                 // (stateChanged will be notified). The backoff is here just to
                 // avoid spamming the NOTICE message.
@@ -2196,6 +2231,8 @@ RaftConsensus::stateMachineUpdaterThreadMain()
                 backoffUntil = now + STATE_MACHINE_UPDATER_BACKOFF;
             }
         }
+        // 14. 进入睡眠，等待下次向某server节点appendEntries后response返回了其supported version区间时被唤醒，
+        //     或者直到backoffUntil超时被唤醒。
         if (backoffUntil <= now)
             stateChanged.wait(lockGuard);
         else

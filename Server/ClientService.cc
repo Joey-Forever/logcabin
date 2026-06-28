@@ -174,6 +174,16 @@ ClientService::stateMachineCommand(RPC::ServerRPC rpc)
     uint64_t logIndex = result.second;
     // 3. 等待对应业务操作的raft log最终被apply到state machine后构造rpc response
     if (!globals.stateMachine->waitForResponse(logIndex, request, response)) {
+        // !!!
+        // 如果leader在apply一条state machine command的时候state machine是某个runningVersion，
+        // 说明这个runningVersion必然已经被apply，说明这个runningVersion必然已经commit。其他follower
+        // 节点可以不需要此时实时的runningVersion和leader保持一致。但是他的commit log必然和leader保持一致，
+        // 也就意味着follower节点未来apply到同一条state machine command的时候，state machine runningVersion
+        // 必然会apply成和leader现在的一样，进而对同一条state machine command的apply进行和leader现在情况一样的
+        // 约束。
+        // 因此，如果leader此时在apply这条state machine command的时候的结果是invalid request，那么其他follower
+        // 节点后续也必然是invalid request，从而不会真正apply这条command。所以leader在这里直接返回invalid request
+        // 给client是全集群的共识，其他follower节点在apply这条command时也会是这个结果。
         rpc.rejectInvalidRequest();
         return;
     }
