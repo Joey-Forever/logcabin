@@ -92,12 +92,19 @@ StateMachine::StateMachine(std::shared_ptr<RaftConsensus> consensus,
     , snapshotThread()
     , snapshotWatchdogThread()
 {
+    // 1. state machine初始的versionHistory只有1，runningVersion也只到1
     versionHistory.insert({0, 1});
+    // 2. 将当前运行代码的state machine版本区间设置进localServer中，用于集群leader
+    //    节点获取后进行集群滚动升级
     consensus->setSupportedStateMachineVersions(MIN_SUPPORTED_VERSION,
                                                 MAX_SUPPORTED_VERSION);
+    // 3. state machine初始化时先创建必要的几个线程
     if (!stateMachineSuppressThreads) {
+    //  1）用于将raft log中已经commit的log entry apply到state machine中
         applyThread = std::thread(&StateMachine::applyThreadMain, this);
+    //  2）用于触发snapshot的生成（通过fork一个子进程的方式，COW）
         snapshotThread = std::thread(&StateMachine::snapshotThreadMain, this);
+    //  3）用于主进程监听子进程的snapshot生成进展
         snapshotWatchdogThread = std::thread(
                 &StateMachine::snapshotWatchdogThreadMain, this);
     }

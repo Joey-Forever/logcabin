@@ -1050,6 +1050,14 @@ RaftConsensus::~RaftConsensus()
     NOTICE("Completed disk writes");
 }
 
+// RaftConsensus实例初始化，主要做这几件事：
+// 1. 从磁盘中恢复raft log到内存中，包括term、voteFor、logStartIndex这些metatdata
+// 2. 将raft log中的历史configuration entry逐一存储到descriptions然后进行覆盖式激活，
+//    激活时会为对应的membership servers创建独立的peer线程
+// 3. 解析磁盘中最新的snapshot header，以该snapshot为基准对raft log进行截断甚至全部抛弃、
+//    用snapshot configuration对本地配置进行覆盖式激活，保存snapshotReader提供给后续state machine的apply线程进行内容读取
+// 4. 将本机stepDown为currentTerm Follower，包括设置选举计时器，超时发起新选举
+// 5. 创建并启动一些必要的后台线程
 void
 RaftConsensus::init()
 {
@@ -1230,28 +1238,39 @@ RaftConsensus::getLeaderHint() const
     return configuration->lookupAddress(leaderId);
 }
 
+// 该方法用于state machine的applyThreadMain线程从raft log中获取下一条用于apply到state machine的entry，
+// 只有当nextIndex entry能够被成功获取时该函数才会返回上层，否则applyThreadMain线程会sleep在RaftConsensus stateChanged上。
 RaftConsensus::Entry
 RaftConsensus::getNextEntry(uint64_t lastIndex) const
 {
     std::unique_lock<Mutex> lockGuard(mutex);
+    // 1. nextIndex是applyThreadMain线程下一步希望进行apply的entry log
     uint64_t nextIndex = lastIndex + 1;
     while (true) {
         if (exiting)
+            // 2. RaftConsensus实例exiting了，直接throw回上层，引发state machine的exit
             throw Core::Util::ThreadInterruptedException();
         if (commitIndex >= nextIndex) {
+            // 3.下一个希望apply的index entry log已经commit了，可以被apply，
+            //   需要构造个entry返回给上层state machine执行
             RaftConsensus::Entry entry;
 
             // Make the state machine load a snapshot if we don't have the next
             // entry it needs in the log.
             if (log->getLogStartIndex() > nextIndex) {
+                // 4. raft log中已经不包括nextIndex了，只能直接apply snapshot了，可能是因为：
+                //    1）该节点当前处于崩溃恢复阶段，需要从index 1开始apply state machine
+                //    2）此前从leader处installSnapshot时本地raft log被截断了
                 entry.type = Entry::SNAPSHOT;
                 // For well-behaved state machines, we expect 'snapshotReader'
                 // to contain a SnapshotFile::Reader that we can return
                 // directly to the state machine. In the case that a State
                 // Machine asks for the snapshot again, we have to build a new
                 // SnapshotFile::Reader again.
+                // 5. 直接将上次readSnapshot时保存的snapshotReader移动给entry，该snapshotReader是一次性使用。
                 entry.snapshotReader = std::move(snapshotReader);
                 if (!entry.snapshotReader) {
+                    // 6. snapshotReader不存在了，可能是之前已经被消费了，需要调用readSnapshot重新打开一个snapshotReader
                     WARNING("State machine asked for same snapshot twice; "
                             "this shouldn't happen in normal operation. "
                             "Having to re-read it from disk.");
@@ -1265,9 +1284,12 @@ RaftConsensus::getNextEntry(uint64_t lastIndex) const
                 entry.clusterTime = lastSnapshotClusterTime;
             } else {
                 // not a snapshot
+                // 7. nextIndex还在raft log中，直接从raft log中获取目标log entry
                 const Log::Entry& logEntry = log->getEntry(nextIndex);
                 entry.index = nextIndex;
                 if (logEntry.type() == Protocol::Raft::EntryType::DATA) {
+                    // 8. 将DATA类型的entry log的data拷贝到entry.command中，因为后续的实际apply是不持有RaftConsensus mutex的，
+                    //    防止直接引用失效。
                     entry.type = Entry::DATA;
                     const std::string& s = logEntry.data();
                     entry.command = Core::Buffer(
@@ -1275,12 +1297,15 @@ RaftConsensus::getNextEntry(uint64_t lastIndex) const
                         s.length(),
                         Core::Buffer::deleteArrayFn<char>);
                 } else {
+                    // 9. 非DATA类型的entry log不需要apply到state machine中，直接skip
                     entry.type = Entry::SKIP;
                 }
                 entry.clusterTime = logEntry.cluster_time();
             }
             return entry;
         }
+        // 10. nextIndex对应的entry log还没有commit，applyThreadMain线程直接sleep在stateChanged，
+        //     等待后面commitIndex被推进后被唤醒重试。
         stateChanged.wait(lockGuard);
     }
 }
@@ -2128,6 +2153,13 @@ operator<<(std::ostream& os, const RaftConsensus& raft)
 // 每个server节点运行代码版本的state machine都支持一套自己的commands，不同版本的state machine可以识别执行的apply命令不同，
 // 如果节点强行apply某条自身不支持的命令，会导致崩溃。
 // 该方法对应的后台线程就是用于leader节点定时更新升级集群的state machine版本，保证集群的state machine版本升级到最新的其中的apply命令能够被所有节点的代码识别的版本。
+// ！！！
+// 之所以要专门一个后台线程负责随时能够醒来升级，是出于集群代码版本 “滚动升级” 需要，也就是，
+// 逐个节点进行停/升/启的流程，在一个节点离线升级过程中，集群多数派节点仍然能够保持在线，
+// 保证集群对外服务不中断，当一个节点升级完重启上线之后，leader节点收到的该节点support版本区间
+// 会发生变化，这时候就需要stateMachineUpdaterThreadMain醒来检查是否需要进行集群代码版本升级。
+// 由于该过程是逐个节点轮流进行，所以leader需要一个随时oncall的后台线程。
+// JOEY_TODO: 做transfer leader，leader自己需要升级时主动让位，避免直接离线导致集群重选举导致服务短暂不可用。
 void
 RaftConsensus::stateMachineUpdaterThreadMain()
 {

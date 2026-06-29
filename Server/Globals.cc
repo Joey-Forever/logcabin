@@ -176,11 +176,11 @@ Globals::init()
                    address.toString().c_str());
         }
         raft->serverAddresses = listenAddressesStr;
-        // JOEY_TODO: 看到这里
         raft->init();
     }
 
     if (!stateMachine) {
+        // JOEY_TODO: 看到这里
         stateMachine.reset(new StateMachine(raft, config, *this));
     }
 
