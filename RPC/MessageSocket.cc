@@ -221,6 +221,10 @@ MessageSocket::sendMessage(MessageId messageId, Core::Buffer contents)
     }
     // Make sure the SendSocket is set up to call writable().
     if (kick)
+        // 这里实际上是为了告知epoll，在后续内核socket send buffer有空间时，唤醒epoll_wait一次，
+        // 随后writable方法会执行sendmsg操作。
+        // oneshot意思是此次set event在后续触发一次后直接disable，防止socket send buffer持续可写但是
+        // 上层实际没东西可发时epoll_wait被疯狂唤醒。
         sendSocketMonitor.setEvents(EPOLLOUT|EPOLLONESHOT);
 }
 
@@ -395,6 +399,11 @@ MessageSocket::writable()
         outbound.bytesSent += size_t(bytesSent);
         if (outbound.bytesSent != (sizeof(Header) +
                                    outbound.message.getLength())) {
+            // ！！！
+            // 此次sendmsg无法将所有内容都send出去，说明socket send buffer空间不足了，
+            // 不再while循环重试，而是重新set event后退出继续epoll_wait：
+            //   1）防止busy loop空转浪费cpu
+            //   2）防止writable方法由于长时间重试导致主线程被占据，导致其他事件无法被及时处理
             sendSocketMonitor.setEvents(EPOLLOUT|EPOLLONESHOT);
             std::lock_guard<Core::Mutex> lockGuard(outboundQueueMutex);
             outboundQueue.emplace_front(std::move(outbound));

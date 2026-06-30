@@ -1021,10 +1021,13 @@ RaftConsensus::RaftConsensus(Globals& globals)
 {
 }
 
+// StateMachine实例析构之后，会引起raft实例引用减一，最终导致raft实例析构
 RaftConsensus::~RaftConsensus()
 {
+    // 理论上，在StateMachine实例析构时已经触发过了raft实例的exit
     if (!exiting)
         exit();
+    // raft exiting已经设置，无锁等待所有raft持有的后台线程退出
     if (leaderDiskThread.joinable())
         leaderDiskThread.join();
     if (timerThread.joinable())
@@ -1035,13 +1038,17 @@ RaftConsensus::~RaftConsensus()
         stepDownThread.join();
     NOTICE("Joined with disk and timer threads");
     std::unique_lock<Mutex> lockGuard(mutex);
+    // while循环等待peer线程数减为0，由于需要访问numPeerThreads，所以需要持锁
     if (numPeerThreads > 0) {
         NOTICE("Waiting for %u peer threads to exit", numPeerThreads);
         while (numPeerThreads > 0)
+            // 放锁sleep
             stateChanged.wait(lockGuard);
     }
     NOTICE("Peer threads have exited");
     // issue any outstanding disk flushes
+    // leaderDiskThread线程退出后，可能还有文件操作未来得及执行，在raft实例析构之前，需要先完成剩余的文件操作，
+    // follower节点的文件操作都是持raft mutex同步执行的，只有leader节点可能存在未来得及执行。
     if (logSyncQueued) {
         std::unique_ptr<Log::Sync> sync = log->takeSync();
         sync->wait();
@@ -1277,6 +1284,7 @@ RaftConsensus::getNextEntry(uint64_t lastIndex) const
                     // readSnapshot() shouldn't have any side effects since the
                     // snapshot should have already been read, so const_cast
                     // should be ok (though ugly).
+                    // 因为getNextEntry是const方法，所以这里必须把this强转成非const this才能调用
                     const_cast<RaftConsensus*>(this)->readSnapshot();
                     entry.snapshotReader = std::move(snapshotReader);
                 }

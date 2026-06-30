@@ -41,22 +41,28 @@ ThreadDispatchService::ThreadDispatchService(
         threads.emplace_back(&ThreadDispatchService::workerMain, this);
 }
 
+// Globals实例销毁时，service实例会比raft实例、state machine实例等功能组件更早析构，
+// 所以在这里等待所有worker threads完成手头工作是安全的
 ThreadDispatchService::~ThreadDispatchService()
 {
     // Signal the threads to exit.
     {
         std::lock_guard<std::mutex> lockGuard(mutex);
+        // 设置service exit为true，唤醒所有worker线程（完成执行手头工作后）直接退出
         exit = true;
         conditionVariable.notify_all();
     }
 
     // Join the threads.
+    // 等待所有worker线程退出
     while (!threads.empty()) {
         threads.back().join();
         threads.pop_back();
     }
 
     // Close the sessions of any remaining RPCs that didn't get processed.
+    // 关闭所有还在queue中排队的rpc request的socket连接，对端rpc层会收到tcp断连。
+    // 由于所有worker线程已经退出了，所以该操作不需要再拿mutex了
     while (!rpcQueue.empty()) {
         rpcQueue.front().closeSession();
         rpcQueue.pop();

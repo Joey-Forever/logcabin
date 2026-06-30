@@ -43,6 +43,7 @@ uint32_t stateMachineChildSleepMs = 0;
 StateMachine::StateMachine(std::shared_ptr<RaftConsensus> consensus,
                            Core::Config& config,
                            Globals& globals)
+    // StateMachine实例需要持有RaftConsensus实例的引用，保证raft实例在StateMachine析构之后再析构，因为state machine实例会调用raft实例。
     : consensus(consensus)
     , globals(globals)
       // This configuration option isn't advertised as part of the public API:
@@ -110,13 +111,17 @@ StateMachine::StateMachine(std::shared_ptr<RaftConsensus> consensus,
     }
 }
 
+// 由于StateMachine持有raft实例的引用，所以state machine析构时raft实例必然还存在
 StateMachine::~StateMachine()
 {
     NOTICE("Shutting down");
+    // StateMachine析构时raft实例必然还存在，先调用raft实例的exit，引发raft实例成员方法下工作的后台线程以及所有的peer线程退出
     if (consensus) // sometimes missing for testing
         consensus->exit();
+    // applyThreadMain线程会在执行raft的getNextEntry方法时看到raft exiting而退出
     if (applyThread.joinable())
         applyThread.join();
+    // applyThreadMain线程退出时会设置state machine exiting，随后触发statemachine相关的后台线程退出
     if (snapshotThread.joinable())
         snapshotThread.join();
     if (snapshotWatchdogThread.joinable())
@@ -396,6 +401,7 @@ StateMachine::apply(const RaftConsensus::Entry& entry)
     }
 }
 
+// JOEY_TODO: 看到这里
 void
 StateMachine::applyThreadMain()
 {
