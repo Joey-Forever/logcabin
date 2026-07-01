@@ -111,6 +111,8 @@ StateMachine::StateMachine(std::shared_ptr<RaftConsensus> consensus,
     }
 }
 
+// 实际上，当主线程的析构流程执行到这里的时候，所有service的worker线程都已经安全退出了，
+// 后续需要处理的只有state machine实例和raft实例内部创建的后台线程以及所有的peer线程的安全退出了。
 // 由于StateMachine持有raft实例的引用，所以state machine析构时raft实例必然还存在
 StateMachine::~StateMachine()
 {
@@ -118,6 +120,10 @@ StateMachine::~StateMachine()
     // StateMachine析构时raft实例必然还存在，先调用raft实例的exit，引发raft实例成员方法下工作的后台线程以及所有的peer线程退出
     if (consensus) // sometimes missing for testing
         consensus->exit();
+
+    // ！！！
+    // 必须先在此等待所有state machine内部创建的后台线程都退出了，才可以进入raft实例的析构，因为这些后台线程会使用到raft实例方法。
+
     // applyThreadMain线程会在执行raft的getNextEntry方法时看到raft exiting而退出
     if (applyThread.joinable())
         applyThread.join();
@@ -401,46 +407,65 @@ StateMachine::apply(const RaftConsensus::Entry& entry)
     }
 }
 
-// JOEY_TODO: 看到这里
+// 该方法是state machine的用于将commit index apply到state machine中的后台线程执行函数，
+// 在commitIndex未被推进到next apply entry的绝大多数时候，该线程都是在Raftconsensus实例的getNextEntry
+// 方法内sleep wait stateChanged，等待commitIndex被推进后被唤醒。
 void
 StateMachine::applyThreadMain()
 {
     Core::ThreadId::setName("StateMachine");
     try {
         while (true) {
+            // 1. 先进入Raftconsensus实例的genNextEntry方法中阻塞性获取next apply entry，
+            //    这里先不会持有state machine mutex，因为进入getNextEntry后会持有raft mutex
+            //    执行相关操作或sleep wait stateChanged。
             RaftConsensus::Entry entry = consensus->getNextEntry(lastApplied);
+            // 2. 成功拿到了next apply entry，开始持有state machine mutex进入真正的apply等操作。
             std::lock_guard<Core::Mutex> lockGuard(mutex);
             switch (entry.type) {
                 case RaftConsensus::Entry::SKIP:
+                    // 3. 该entry不是state machine关心的DATA类型entry log，直接跳过
                     break;
                 case RaftConsensus::Entry::DATA:
+                    // 4. 该entry是DATA类型entry log，真正执行apply state machine操作
                     apply(entry);
                     break;
                 case RaftConsensus::Entry::SNAPSHOT:
+                    // 5. 该entry是snaoshot类型，说明本机的raft log已经无法提供单条的next apply entry log，
+                    //    直接将整个state machine用snapshot内容替代。
                     NOTICE("Loading snapshot through entry %lu into state "
                            "machine", entry.index);
                     loadSnapshot(*entry.snapshotReader);
                     NOTICE("Done loading snapshot");
                     break;
             }
+            // 6. state machine已经apply到了一个新的index，用对应的clusterTime对
+            //    过期client session进行清理。
+            // JOEY_TODO: 看到这里
             expireSessions(entry.clusterTime);
             lastApplied = entry.index;
-            // 有新的raft log被apply到了state machine，lastApplied已经被更新，
-            // 唤醒所有在waitForResponse中wait entriesApplied的rpc service.
+            // 7.有新的raft log被apply到了state machine，lastApplied已经被更新，
+            //   唤醒所有在wait entriesApplied的rpc service.
             entriesApplied.notify_all();
+            // 8. 判断当前是否适合进行打新snapshot的操作，然后唤醒snapshotThreadMain后台线程
             if (shouldTakeSnapshot(lastApplied) &&
                 maySnapshotAt <= Clock::now()) {
                 snapshotSuggested.notify_all();
             }
         }
     } catch (const Core::Util::ThreadInterruptedException&) {
+        // 9. applyThreadMain线程在getNextEntry方法内获知了raft实例已经设置了exiting，直接throw到了这里，
+        //    说明当前的Globals实例正在执行析构流程。
         NOTICE("exiting");
         std::lock_guard<Core::Mutex> lockGuard(mutex);
+        // 10.在applyThreadMain线程退出之前，先设置state machine的exiting，然后通知所有state machine相关的后台线程进行退出。
+        //    由于当Globals实例的析构流程走到这里的时候，所有service的worker线程都已经安全退出，所以这里主要是state machine内部创建的后台线程。
         exiting = true;
         entriesApplied.notify_all();
         snapshotSuggested.notify_all();
         snapshotStarted.notify_all();
         snapshotCompleted.notify_all();
+        // 11. 如果snapshot生成子进程存在，就发送SIGTERM信号杀死。
         killSnapshotProcess(Core::HoldingMutex(lockGuard), SIGTERM);
     }
 }
@@ -508,6 +533,12 @@ StateMachine::getVersion(uint64_t logIndex) const
     return it->second;
 }
 
+// 父进程使用该方法向snapshot子进程发送SIGTERM信号直接将其杀死，由于子进程生成snapshot时
+// 只会对state machine进行序列化和写临时partial文件，partial文件是否被rename成有效snapshot文件
+// 由父进程决定，所以直接kill子进程只会损坏临时的partial文件，后续父进程再进行清理即可。
+// ！！！
+// 由于该方法并不是一个单独的原子方法，而是一个helper方法使得这块逻辑可被复用，所以不应该在内部单独加锁，
+// 通过强制caller传递HoldingMutex参数的方式，让caller确保在调用该方法前已经获得了锁。
 void
 StateMachine::killSnapshotProcess(Core::HoldingMutex holdingMutex,
                                   int signum)

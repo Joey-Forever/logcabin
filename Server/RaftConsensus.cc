@@ -953,6 +953,10 @@ RaftConsensus::Entry::~Entry()
 
 // JOEY_TODO: 做multi-raft，做batching/pipelining
 RaftConsensus::RaftConsensus(Globals& globals)
+    // election_timeout和heartbeat_period两个参数不会影响复制状态机状态，只是server节点本地的行为配置，
+    // 所以即使集群各个server节点不一致也不影响状态机正确性，因此不需要进raft log进行集群共识（事实上，对于这类
+    // 参数，即使进了共识，何时生效也难以协调，参考configuration membership变更）。但是，实际应用时应该保持这些
+    // 参数是集群一致的（运维保证集群节点共享一份config模板），因为会影响集群可用性。
     : ELECTION_TIMEOUT(
         std::chrono::milliseconds(
             globals.config.read<uint64_t>(

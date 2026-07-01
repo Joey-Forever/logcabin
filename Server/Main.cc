@@ -348,6 +348,9 @@ main(int argc, char** argv)
                 globals.raft->bootstrapConfiguration();
                 NOTICE("Done bootstrapping configuration. Exiting.");
             } else {
+                // ！！！
+                // 在主线程进入event loop执行runForever前要关闭signal blocker的析构时unblock行为，防止
+                // 在globals析构到最后的时候signal unblock导致pending signal执行默认行为导致程序表现为异常退出。
                 globals.leaveSignalsBlocked();
                 globals.run();
             }
