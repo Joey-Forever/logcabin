@@ -738,3 +738,336 @@ C++ Multi-Raft 强一致分布式内存 KV 数据库
 - 实现 segmented copy-on-write snapshot，仅重写 dirty segments，并通过 MANIFEST 原子切换保证崩溃安全；
 - 支持 snapshot 成功持久化后的 Raft log compaction，并通过故障注入测试覆盖 leader crash、NotLeader retry、节点重启、snapshot 过程中崩溃等场景。
 ```
+
+---
+
+## 18. 跨 Raft Group 原子写入与 TiKV GC 处理参考
+
+单条 SQL / 原子命令如果要同时写多个 Raft Group，不应该让一个 Raft 共识实例覆盖多个 Group，而是在每个 Group 内部继续使用独立 Raft，跨 Group 的原子性由事务层负责。
+
+例如一条原子命令：
+
+```text
+txn_id / start_ts = 100
+primary key = 10
+
+groupA 写入:
+  10 -> "我是爸爸"
+
+groupB 写入:
+  11 -> "我是爷爷"
+```
+
+如果原始状态机只是：
+
+```cpp
+std::map<int, std::string> data;
+```
+
+则 prewrite 阶段不能直接写入 `data`，否则 groupA 成功、groupB 失败时，新值已经对外可见，跨 Group 原子性会被破坏。
+
+状态机需要扩展为 MVCC / 事务状态：
+
+```cpp
+struct Lock {
+    uint64_t txn_id;
+    int primary_key;
+    enum Type { Put, Delete, Lock } type;
+};
+
+struct WriteRecord {
+    uint64_t start_ts;
+    uint64_t commit_ts;
+    enum Type { Put, Delete, Rollback } type;
+};
+
+struct DataState {
+    std::map<int, std::string> committed;
+    std::map<int, Lock> locks;
+    std::map<std::pair<int, uint64_t>, std::string> pending;
+    std::set<std::pair<int, uint64_t>> rollback_records;
+
+    // GC safe point。GC 负责清理 safe point 之前的 rollback record / 历史版本。
+    uint64_t gc_safe_point = 0;
+};
+```
+
+### 18.1 2PC 写入流程
+
+prewrite groupA：
+
+```cpp
+locks[10] = Lock{
+    .txn_id = 100,
+    .primary_key = 10,
+    .type = Lock::Put,
+};
+
+pending[{10, 100}] = "我是爸爸";
+```
+
+prewrite groupB：
+
+```cpp
+locks[11] = Lock{
+    .txn_id = 100,
+    .primary_key = 10,
+    .type = Lock::Put,
+};
+
+pending[{11, 100}] = "我是爷爷";
+```
+
+prewrite 成功后，新值还不能进入 `committed`，因此外部读不到新值，只能看到锁。
+
+所有 Group 的 prewrite 都确认成功之后，协调者才能进入 commit 阶段：
+
+```text
+1. commit primary key 10
+2. commit secondary key 11
+```
+
+commit groupA primary：
+
+```cpp
+committed[10] = pending[{10, 100}];
+pending.erase({10, 100});
+locks.erase(10);
+```
+
+commit groupB secondary：
+
+```cpp
+committed[11] = pending[{11, 100}];
+pending.erase({11, 100});
+locks.erase(11);
+```
+
+如果 groupB prewrite 超时，协调者不能把它当成明确失败，因为请求可能已经在 groupB 成功 apply，只是响应丢失。正确做法是重试同一个 prewrite。prewrite 必须幂等：
+
+```text
+same txn_id + same key + same mutation
+  -> 如果已经写入 lock/pending，则返回成功
+  -> 如果已经 rollback，则返回 AlreadyRollback / TxnTooOld
+```
+
+如果最终决定放弃事务，需要对所有相关 Group 发送 rollback。rollback 也必须幂等：
+
+```cpp
+if (locks.contains(key) && locks[key].txn_id == txn_id) {
+    locks.erase(key);
+    pending.erase({key, txn_id});
+}
+
+rollback_records.insert({key, txn_id});
+```
+
+rollback marker 不能马上删除。它至少要保留到系统的 GC safe point 超过该事务的 `start_ts`。prewrite 路径需要优先检查同 `start_ts` 的 rollback record，防止 cleanup / rollback 之后迟到的 prewrite 重新成功：
+
+```cpp
+Status Prewrite(int key, std::string value, uint64_t start_ts, int primary_key) {
+    if (rollback_records.contains({key, start_ts})) {
+        return AlreadyRollback;
+    }
+
+    if (locks.contains(key)) {
+        if (locks[key].txn_id == start_ts) {
+            return OK; // 幂等重试
+        }
+        return Locked;
+    }
+
+    locks[key] = Lock{
+        .txn_id = start_ts,
+        .primary_key = primary_key,
+        .type = Lock::Put,
+    };
+    pending[{key, start_ts}] = value;
+    return OK;
+}
+```
+
+### 18.2 primary 状态与 secondary lock 恢复
+
+如果 primary 已经 commit，但 secondary commit 请求丢失，secondary Group 可能长期残留：
+
+```text
+locks[11] = Lock{txn_id=100, primary_key=10}
+pending[{11, 100}] = "我是爷爷"
+```
+
+后续访问 `11` 或后台 GC 扫到这个锁时，需要查 primary 状态：
+
+```text
+CheckTxnStatus(primary=10, start_ts=100)
+```
+
+如果 primary 已提交，则补提交 secondary：
+
+```cpp
+committed[11] = pending[{11, 100}];
+pending.erase({11, 100});
+locks.erase(11);
+```
+
+如果 primary 已回滚，则清理 secondary：
+
+```cpp
+pending.erase({11, 100});
+locks.erase(11);
+rollback_records.insert({11, 100});
+```
+
+因此 primary key 的状态是事务最终结局的锚点：
+
+```text
+primary committed -> secondary should commit
+primary rollback   -> secondary should rollback
+```
+
+普通 2PC 下，primary commit record 不需要保存所有 secondary keys。secondary lock 自己保存 primary 指针：
+
+```text
+secondary lock:
+  key = 11
+  start_ts = 100
+  primary = 10
+```
+
+所以恢复路径是从 secondary lock 反查 primary 状态，而不是从 primary commit record 主动找到所有 secondaries。
+
+### 18.3 GC 的关键不变量
+
+不能出现这种状态：
+
+```text
+primary 的 commit / rollback 证据已经被 GC 删除
+secondary 还残留需要依赖 primary 判断结局的 lock
+```
+
+否则 secondary 访问者看到 pending lock 后，去 primary 查询却发现没有记录，无法区分：
+
+```text
+1. primary 从未提交，事务应 rollback
+2. primary 曾经提交，但 commit 记录已经被 GC 删除
+```
+
+因此 GC 必须满足：
+
+```text
+删除 primary 事务状态之前，所有 start_ts <= safe_point 的残留 lock 必须已经被 resolve。
+```
+
+贴近 TiKV 的流程：
+
+```text
+1. meta raft leader 选择 target_safe_point
+2. GC worker 扫描所有 data group 的 lock.ts <= target_safe_point
+3. 对扫到的 old lock 查 primary，并 commit / rollback secondary
+4. old locks resolve 完成后，推进 gc_safe_point
+5. data group 根据 gc_safe_point 物理删除旧版本和过老 rollback marker
+```
+
+下面这个时序在标准 2PC 里本身不成立：
+
+```text
+1. groupB 的旧 prewrite(start_ts=100) 在网络里卡住
+2. GC 扫 groupB，没有扫到这个 lock
+3. GC 推进 gc point = 200
+4. groupA 删除 primary commit 证据
+5. groupB 还没收到 gc point
+6. 迟到 prewrite 到达 groupB
+7. 如果 groupB 只看本地 gc point，就可能错误接受旧 prewrite
+```
+
+原因是：如果 groupB 是这个事务的 secondary，且 groupB 的 prewrite 从未确认成功，则协调者不能 commit groupA primary。TiKV 靠标准 2PC 的提交前置条件消除该场景。
+
+### 18.4 meta raft group 的职责边界
+
+可以用一个 meta raft group 管理全局元信息：
+
+```cpp
+struct MetaState {
+    uint64_t next_tso;
+    uint64_t gc_safe_point;
+    uint64_t gc_epoch;
+
+    // shard / range 路由、节点 membership、全局配置等。
+};
+```
+
+meta raft group 可以负责：
+
+```text
+1. 分配 TSO / start_ts / commit_ts
+2. 维护 GC safe point
+3. 记录 Region / Shard 路由
+4. 选出或直接承载 GC worker
+5. 维护全局配置与 membership
+```
+
+meta raft group 的 leader 可以直接作为 GC worker，但 GC 任务必须跑在后台线程中，不能阻塞 meta raft apply / heartbeat / TSO 请求。
+
+GC RPC 建议携带 epoch 信息：
+
+```text
+meta_term
+gc_epoch
+target_safe_point
+```
+
+data group 只接受当前有效 epoch 的 GC 请求，避免旧 meta leader 失去 leadership 后继续执行过期 GC。
+
+同时，meta raft group 不应该参与每条跨 Group 事务的提交决策，否则会变成全局事务瓶颈。它只提供时间戳和全局元信息；数据写入仍然由各 data raft group 通过 MVCC + 2PC 完成。
+
+### 18.5 TiKV 的实际处理方式
+
+TiKV / TiDB 的核心不是在每个 primary commit record 里记录所有 secondary keys，而是：
+
+```text
+1. 普通 2PC 中，TiDB 必须确认所有 secondary prewrite 成功后，才允许 commit primary。
+2. secondary lock 里保存 primary key 指针。
+3. 后续访问或 GC 扫到 secondary lock 时，通过 primary key 查询事务状态。
+4. primary committed 则补 commit secondary。
+5. primary rollback / expired 则 rollback secondary。
+```
+
+所以这种时序在正确 TiKV 2PC 协议里不成立：
+
+```text
+groupB 第一次 prewrite 还没成功
+groupA primary 已经 commit
+```
+
+如果 groupB prewrite 超时，TiDB 会重试确认；确认不了不能 commit primary，只能走 cleanup / rollback。
+
+TiKV 的 GC 也不是由 primary commit record 驱动去找 secondaries，而是由全局 GC safe point 驱动：
+
+```text
+1. TiDB 集群中选出的 GC owner / GC worker 计算 safe point。
+2. GC worker 在 Do GC 之前执行 Resolve Locks。
+3. Resolve Locks 逻辑上覆盖全局 keyspace，扫描 safe point 之前的 old locks。
+4. 实际扫描下推到各 TiKV store / Region，本地扫描 Lock CF。
+5. 扫到 old secondary lock 后，lock resolver 查 primary 状态并 resolve。
+6. old locks 处理完成后，再进入物理 GC，删除旧 MVCC 版本。
+```
+
+因此 TiKV 避免了：
+
+```text
+primary commit 证据先被删
+secondary lock 后发现但无法判断事务结局
+```
+
+GC 的网络和扫描压力客观存在，但它不在事务提交关键路径上，并且通过后台周期执行、批量扫描、只扫 Lock CF、分布式下推到 TiKV、限速和重试来控制成本。
+
+对自研 Multi-Raft KV 来说，最保守且容易证明正确的设计是：
+
+```text
+1. commit primary 之前，必须确认所有 prewrite 成功。
+2. prewrite / rollback / commit 都必须幂等。
+3. rollback marker 防止 cleanup / rollback 之后迟到 prewrite 复活事务。
+4. physical GC 前必须先 resolve old locks。
+5. 删除 primary 状态前，必须保证不会再出现依赖该 primary 状态的 old secondary lock。
+6. meta raft 负责 TSO、safe point、GC epoch 和路由；data raft group 负责 MVCC 状态机和事务 apply。
+```

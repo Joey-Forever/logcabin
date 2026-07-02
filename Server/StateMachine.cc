@@ -62,6 +62,12 @@ StateMachine::StateMachine(std::shared_ptr<RaftConsensus> consensus,
       // of the value and its changes, so that they can send keep-alives at
       // appropriate intervals. For now, servers time out after about an hour,
       // and clients send keep-alives every minute.
+      // 这个东西涉及到state machine中sessions表的数据正确性，如果每个server节点的配置不一致的话，
+      // 会导致集群的共识出现偏差，出现有的server apply到了某个index时一个session失效了但是其他
+      // server apply到这个index时却没有失效该session。所以这个东西放在config中可配置就会比较危险。
+      // 并且在可配置的情况下，必须将该值加入raft log做共识，并且必须告知client端做keepalive调整，所以
+      // 总的看来，作者选择直接在代码中写死该数值了。
+      // 这也能看出，其实sessions去重表并不适合在raft state machine中内建，更合适的是把command幂等控制权完全交给业务层。
     , sessionTimeoutNanos(1000UL * 1000 * 1000 * 60 * 60)
     , unknownRequestMessageBackoff(std::chrono::milliseconds(
             config.read<uint64_t>("stateMachineUnknownRequestMessage"
@@ -326,10 +332,14 @@ void
 StateMachine::apply(const RaftConsensus::Entry& entry)
 {
     Command::Request command;
+    // 1. 从 entry中解析出实际的command
     if (!Core::ProtoBuf::parse(entry.command, command)) {
         PANIC("Failed to parse protobuf for entry %lu",
               entry.index);
     }
+    // 2. 获取当前command在apply时对应的最新的集群state machine version，可用于判断该条命令需不需要实际执行，
+    //    这是对版本落后server的保护，因为有的落后版本server代码无法识别某条command。由于version update是
+    //    进入raft log共识的，所以可以保持集群一致，即当前apply的command要么所有节点都执行要么所有都不执行。
     uint16_t runningVersion = getVersion(entry.index - 1);
     if (command.has_tree()) {
         PC::ExactlyOnceRPCInfo rpcInfo = command.tree().exactly_once();
@@ -366,13 +376,18 @@ StateMachine::apply(const RaftConsensus::Entry& entry)
             sessions.erase(command.close_session().client_id());
         } else {
             // Command is ignored in version < 2.
+            // 3. 虽然当前代码能够识别该command，但是由于apply到该entry时集群的runningVersion还未升级到该新版本，
+            //    所以必须忽略，对旧版本节点保持兼容。
             warnUnknownRequest(command, "may not process the given request, "
                                "which was introduced in version 2");
         }
     } else if (command.has_advance_version()) {
+        // 4. 该command是一条集群state machine版本升级命令
         uint16_t requested = Core::Util::downCast<uint16_t>(
                 command.advance_version(). requested_version());
         if (requested < runningVersion) {
+            // 5. 升级的版本小于runningVersion，拒绝降级。这种情况一般是由于有旧版本server加入了集群，
+            //    导致leader发起了低版本升级，新版本server直接拒绝即可，旧版本server会自行PANIC。
             WARNING("Rejecting downgrade of state machine version "
                     "(running version %u but command at log index %lu wants "
                     "to switch to version %u)",
@@ -382,6 +397,9 @@ StateMachine::apply(const RaftConsensus::Entry& entry)
             ++numRejectedAdvanceVersionEntries;
         } else if (requested > runningVersion) {
             if (requested > MAX_SUPPORTED_VERSION) {
+                // 6. 升级的版本虽然比runningVersion大，但是比本机当前运行代码的support max版本还要大，
+                //    直接崩溃。这一般发生在本机作为新加入集群的server节点运行了旧版本代码，但是其实集群此前已经
+                //    升级到了该更新的版本，如果允许这类server节点加入集群，将会导致集群版本降级，所以直接崩了本机。
                 PANIC("Cannot upgrade state machine to version %u (from %u) "
                       "because this code only supports up to version %u",
                       requested,
@@ -391,6 +409,8 @@ StateMachine::apply(const RaftConsensus::Entry& entry)
                 NOTICE("Upgrading state machine to version %u (from %u)",
                        requested,
                        runningVersion);
+                // 7. 成功升级，将新版本insert进versionHistory中生效，后续的command apply将以该最新version为runningVersion
+                //    决定是否apply。
                 versionHistory.insert({entry.index, requested});
             }
             ++numSuccessfulAdvanceVersionEntries;
@@ -403,6 +423,8 @@ StateMachine::apply(const RaftConsensus::Entry& entry)
     } else { // unknown command
         // This is (deterministically) ignored by all state machines running
         // the current version.
+        // 8. 本机当前运行的代码版本无法识别该command因此无法apply，说明本机运行的代码版本较旧，其他
+        //    新版本server即使能够识别该command也不会执行，滚动升级照顾的正是这类旧版本server。
         warnUnknownRequest(command, "does not understand the given request");
     }
 }
@@ -435,13 +457,13 @@ StateMachine::applyThreadMain()
                     //    直接将整个state machine用snapshot内容替代。
                     NOTICE("Loading snapshot through entry %lu into state "
                            "machine", entry.index);
+                    // JOEY_TODO: 看到这里
                     loadSnapshot(*entry.snapshotReader);
                     NOTICE("Done loading snapshot");
                     break;
             }
             // 6. state machine已经apply到了一个新的index，用对应的clusterTime对
             //    过期client session进行清理。
-            // JOEY_TODO: 看到这里
             expireSessions(entry.clusterTime);
             lastApplied = entry.index;
             // 7.有新的raft log被apply到了state machine，lastApplied已经被更新，
@@ -504,6 +526,9 @@ StateMachine::expireResponses(Session& session, uint64_t firstOutstandingRPC)
     }
 }
 
+// 在state machine成功apply/skip一条entry log后，需要已最新的entry clusterTime为基准
+// 删除所有已过时的session，由于集群所有节点apply到同一个index时的clusterTime都相同，所以
+// 过时的session也保持一致。
 void
 StateMachine::expireSessions(uint64_t clusterTime)
 {

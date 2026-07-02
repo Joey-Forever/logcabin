@@ -201,6 +201,9 @@ LeaderRPC::call(OpCode opCode,
                 return Status::TIMEOUT;
             case Call::Status::RETRY:
             // rpc层的心跳ping失败时候会触发这里的retry，这里的retry会基于同一个{client_id, rpc_number}进行，所以不会导致server重复写（状态机中sessions表保证）
+            // JOEY_TODO: 只对只读/幂等/明确未发送的请求进行自动重试，对于读写/非幂等的请求直接返回给上层处理。然后raft不再在state machine中
+            //            内建维护sessions表。如果业务有需求，自行在state machine中创建维护去重表即可。
+            // JOEY_TODO: 做Txn原子if-else命令。
                 break;
             case Call::Status::INVALID_REQUEST:
                 return Status::INVALID_REQUEST;
